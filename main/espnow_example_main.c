@@ -31,8 +31,24 @@
 #include "esp_crc.h"
 #include "espnow_example.h"
 #include "sensor.h"
+#include "esp_sleep.h"
+#include "esp_pm.h"
+#include "esp_timer.h"
 
 #define ESPNOW_MAXDELAY 512
+
+// Sleep configuration
+#define SLEEP_DURATION_SECONDS 10
+#define WAKE_DURATION_SECONDS 10
+
+// Sleep variables
+static esp_timer_handle_t sleep_timer = NULL;
+static bool is_sleep_mode = false;
+static esp_pm_config_t pm_config = {
+    .max_freq_mhz = 80,
+    .min_freq_mhz = 10,
+    .light_sleep_enable = true
+};
 
 static const char *TAG = "espnow_example";
 
@@ -42,6 +58,12 @@ static uint8_t s_example_broadcast_mac[ESP_NOW_ETH_ALEN] = { 0xFF, 0xFF, 0xFF, 0
 static uint16_t s_example_espnow_seq[EXAMPLE_ESPNOW_DATA_MAX] = { 0, 0 };
 
 static void example_espnow_deinit(example_espnow_send_param_t *send_param);
+
+// Sleep function declarations
+static void sleep_device(void);
+static void sleep_timer_callback(void* arg);
+static void enable_automatic_light_sleep(void);
+static void disable_automatic_light_sleep(void);
 
 
 /* WiFi should start before using ESPNOW */
@@ -59,6 +81,72 @@ static void example_wifi_init(void)
 #if CONFIG_ESPNOW_ENABLE_LONG_RANGE
     ESP_ERROR_CHECK( esp_wifi_set_protocol(ESPNOW_WIFI_IF, WIFI_PROTOCOL_11B|WIFI_PROTOCOL_11G|WIFI_PROTOCOL_11N|WIFI_PROTOCOL_LR) );
 #endif
+}
+
+// Sleep timer callback function
+static void sleep_timer_callback(void* arg)
+{
+    ESP_LOGI(TAG, "Sleep timer expired, entering deep sleep mode");
+    sleep_device();
+}
+
+// Function to put device into deep sleep
+static void sleep_device(void)
+{
+    ESP_LOGI(TAG, "Preparing to enter deep sleep");
+    
+    // Stop sleep timer
+    if (sleep_timer) {
+        esp_timer_stop(sleep_timer);
+        esp_timer_delete(sleep_timer);
+        sleep_timer = NULL;
+    }
+    
+    // Deinitialize WiFi and ESPNOW to save power
+    esp_now_deinit();
+    esp_wifi_stop();
+    esp_wifi_deinit();
+    
+    // Configure wake up sources
+    esp_sleep_enable_timer_wakeup(SLEEP_DURATION_SECONDS * 1000000ULL);
+    
+    ESP_LOGI(TAG, "Deep sleep configured - wake up in %d seconds", SLEEP_DURATION_SECONDS);
+    
+    // Enter deep sleep
+    esp_deep_sleep_start();
+}
+
+// Enable automatic light sleep for power optimization
+static void enable_automatic_light_sleep(void)
+{
+    ESP_LOGI(TAG, "Enabling automatic light sleep for power optimization");
+    
+    esp_err_t ret = esp_pm_configure(&pm_config);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to configure power management: %s", esp_err_to_name(ret));
+        return;
+    }
+    
+    ESP_LOGI(TAG, "Automatic light sleep enabled successfully");
+}
+
+// Disable automatic light sleep
+static void disable_automatic_light_sleep(void)
+{
+    ESP_LOGI(TAG, "Disabling automatic light sleep");
+    
+    esp_pm_config_t pm_config_no_sleep = {
+        .max_freq_mhz = 80,
+        .min_freq_mhz = 80,
+        .light_sleep_enable = false
+    };
+    
+    esp_err_t ret = esp_pm_configure(&pm_config_no_sleep);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to disable light sleep: %s", esp_err_to_name(ret));
+    } else {
+        ESP_LOGI(TAG, "Automatic light sleep disabled");
+    }
 }
 
 /* ESPNOW sending or receiving callback function is called in WiFi task.
@@ -382,6 +470,17 @@ static void example_espnow_deinit(example_espnow_send_param_t *send_param)
 
 void app_main(void)
 {
+    // Check if we woke up from deep sleep
+    esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
+    
+    if (wakeup_reason == ESP_SLEEP_WAKEUP_TIMER) {
+        ESP_LOGI(TAG, "Woke up from deep sleep by timer");
+        is_sleep_mode = false;
+    } else {
+        ESP_LOGI(TAG, "Starting fresh boot");
+        is_sleep_mode = false;
+    }
+
     // Initialize NVS
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -399,5 +498,30 @@ void app_main(void)
         ESP_LOGE(TAG, "Failed to initialize sensor: %s", esp_err_to_name(sensor_ret));
     } else {
         ESP_LOGI(TAG, "Sensor initialized successfully");
+    }
+
+    // Enable automatic light sleep for power optimization
+    enable_automatic_light_sleep();
+
+    // Create timer for sleep cycle - wake for WAKE_DURATION_SECONDS then sleep for SLEEP_DURATION_SECONDS
+    ESP_LOGI(TAG, "Starting sleep/wake cycle - will deep sleep in %d seconds", WAKE_DURATION_SECONDS);
+    
+    const esp_timer_create_args_t sleep_timer_args = {
+        .callback = &sleep_timer_callback,
+        .name = "sleep_timer"
+    };
+    
+    ret = esp_timer_create(&sleep_timer_args, &sleep_timer);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to create sleep timer: %s", esp_err_to_name(ret));
+    } else {
+        // Start timer for wake duration
+        ret = esp_timer_start_once(sleep_timer, WAKE_DURATION_SECONDS * 1000000ULL);
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to start sleep timer: %s", esp_err_to_name(ret));
+        } else {
+            ESP_LOGI(TAG, "Sleep timer started - device will deep sleep in %d seconds", WAKE_DURATION_SECONDS);
+            ESP_LOGI(TAG, "Automatic light sleep is active for power optimization");
+        }
     }
 }
