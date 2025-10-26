@@ -37,13 +37,14 @@
 
 #define ESPNOW_MAXDELAY 512
 
-// Sleep configuration
+// Sleep configuration - Use light sleep instead of deep sleep for better power efficiency
 #define SLEEP_DURATION_SECONDS 10
 #define WAKE_DURATION_SECONDS 10
 
 // Sleep variables
 static esp_timer_handle_t sleep_timer = NULL;
 static bool is_sleep_mode = false;
+static bool sensor_initialized = false; // Track sensor initialization state
 static esp_pm_config_t pm_config = {
     .max_freq_mhz = 80,
     .min_freq_mhz = 10,
@@ -64,6 +65,7 @@ static void sleep_device(void);
 static void sleep_timer_callback(void* arg);
 static void enable_automatic_light_sleep(void);
 static void disable_automatic_light_sleep(void);
+static esp_err_t create_sleep_timer(void);
 
 
 /* WiFi should start before using ESPNOW */
@@ -86,14 +88,14 @@ static void example_wifi_init(void)
 // Sleep timer callback function
 static void sleep_timer_callback(void* arg)
 {
-    ESP_LOGI(TAG, "Sleep timer expired, entering deep sleep mode");
+    ESP_LOGI(TAG, "Sleep timer expired, entering light sleep mode");
     sleep_device();
 }
 
-// Function to put device into deep sleep
+// Function to put device into light sleep (more power efficient than deep sleep)
 static void sleep_device(void)
 {
-    ESP_LOGI(TAG, "Preparing to enter deep sleep");
+    ESP_LOGI(TAG, "Preparing to enter light sleep");
     
     // Stop sleep timer
     if (sleep_timer) {
@@ -102,18 +104,58 @@ static void sleep_device(void)
         sleep_timer = NULL;
     }
     
-    // Deinitialize WiFi and ESPNOW to save power
-    esp_now_deinit();
-    esp_wifi_stop();
-    esp_wifi_deinit();
-    
-    // Configure wake up sources
+    // Configure wake up sources for light sleep
     esp_sleep_enable_timer_wakeup(SLEEP_DURATION_SECONDS * 1000000ULL);
     
-    ESP_LOGI(TAG, "Deep sleep configured - wake up in %d seconds", SLEEP_DURATION_SECONDS);
+    ESP_LOGI(TAG, "Light sleep configured - wake up in %d seconds", SLEEP_DURATION_SECONDS);
     
-    // Enter deep sleep
-    esp_deep_sleep_start();
+    // Enter light sleep (keeps RAM and CPU state, only ~0.8mA vs ~10μA deep sleep)
+    esp_light_sleep_start();
+    
+    // After wake up, continue execution here
+    ESP_LOGI(TAG, "Woke up from light sleep");
+    is_sleep_mode = false;
+    
+    // Recreate timer for next sleep cycle
+    ESP_LOGI(TAG, "Recreating timer for next sleep cycle");
+    esp_err_t ret = create_sleep_timer();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to recreate sleep timer: %s", esp_err_to_name(ret));
+    }
+}
+
+// Create sleep timer function
+static esp_err_t create_sleep_timer(void)
+{
+    // Clean up existing timer if any
+    if (sleep_timer) {
+        esp_timer_stop(sleep_timer);
+        esp_timer_delete(sleep_timer);
+        sleep_timer = NULL;
+    }
+    
+    const esp_timer_create_args_t sleep_timer_args = {
+        .callback = &sleep_timer_callback,
+        .name = "sleep_timer"
+    };
+    
+    esp_err_t ret = esp_timer_create(&sleep_timer_args, &sleep_timer);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to create sleep timer: %s", esp_err_to_name(ret));
+        return ret;
+    }
+    
+    // Start timer for wake duration
+    ret = esp_timer_start_once(sleep_timer, WAKE_DURATION_SECONDS * 1000000ULL);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to start sleep timer: %s", esp_err_to_name(ret));
+        esp_timer_delete(sleep_timer);
+        sleep_timer = NULL;
+        return ret;
+    }
+    
+    ESP_LOGI(TAG, "Sleep timer created and started - will light sleep in %d seconds", WAKE_DURATION_SECONDS);
+    return ESP_OK;
 }
 
 // Enable automatic light sleep for power optimization
@@ -470,15 +512,16 @@ static void example_espnow_deinit(example_espnow_send_param_t *send_param)
 
 void app_main(void)
 {
-    // Check if we woke up from deep sleep
+    // Check if we woke up from light sleep
     esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
     
     if (wakeup_reason == ESP_SLEEP_WAKEUP_TIMER) {
-        ESP_LOGI(TAG, "Woke up from deep sleep by timer");
+        ESP_LOGI(TAG, "Woke up from light sleep by timer - sensor already initialized");
         is_sleep_mode = false;
     } else {
-        ESP_LOGI(TAG, "Starting fresh boot");
+        ESP_LOGI(TAG, "Starting fresh boot - need to initialize sensor");
         is_sleep_mode = false;
+        sensor_initialized = false; // Mark sensor as not initialized
     }
 
     // Initialize NVS
@@ -492,36 +535,38 @@ void app_main(void)
     example_wifi_init();
     example_espnow_init();
 
-    // Initialize sensor module with default configuration
-    esp_err_t sensor_ret = sensor_init();
-    if (sensor_ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to initialize sensor: %s", esp_err_to_name(sensor_ret));
+    // Initialize sensor only if not already initialized (after light sleep wake up)
+    if (!sensor_initialized) {
+        ESP_LOGI(TAG, "Initializing sensor for the first time");
+        esp_err_t sensor_ret = sensor_init();
+        if (sensor_ret != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to initialize sensor: %s", esp_err_to_name(sensor_ret));
+        } else {
+            ESP_LOGI(TAG, "Sensor initialized successfully");
+            sensor_initialized = true;
+        }
     } else {
-        ESP_LOGI(TAG, "Sensor initialized successfully");
+        ESP_LOGI(TAG, "Sensor already initialized, skipping init to save power");
     }
 
     // Enable automatic light sleep for power optimization
     enable_automatic_light_sleep();
 
     // Create timer for sleep cycle - wake for WAKE_DURATION_SECONDS then sleep for SLEEP_DURATION_SECONDS
-    ESP_LOGI(TAG, "Starting sleep/wake cycle - will deep sleep in %d seconds", WAKE_DURATION_SECONDS);
+    ESP_LOGI(TAG, "Starting sleep/wake cycle - will light sleep in %d seconds", WAKE_DURATION_SECONDS);
     
-    const esp_timer_create_args_t sleep_timer_args = {
-        .callback = &sleep_timer_callback,
-        .name = "sleep_timer"
-    };
-    
-    ret = esp_timer_create(&sleep_timer_args, &sleep_timer);
+    ret = create_sleep_timer();
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to create sleep timer: %s", esp_err_to_name(ret));
+        ESP_LOGE(TAG, "Failed to create initial sleep timer: %s", esp_err_to_name(ret));
     } else {
-        // Start timer for wake duration
-        ret = esp_timer_start_once(sleep_timer, WAKE_DURATION_SECONDS * 1000000ULL);
-        if (ret != ESP_OK) {
-            ESP_LOGE(TAG, "Failed to start sleep timer: %s", esp_err_to_name(ret));
-        } else {
-            ESP_LOGI(TAG, "Sleep timer started - device will deep sleep in %d seconds", WAKE_DURATION_SECONDS);
-            ESP_LOGI(TAG, "Automatic light sleep is active for power optimization");
-        }
+        ESP_LOGI(TAG, "Sleep timer started - device will light sleep in %d seconds", WAKE_DURATION_SECONDS);
+        ESP_LOGI(TAG, "Automatic light sleep is active for power optimization");
+    }
+    
+    // Main loop - keep the system running
+    ESP_LOGI(TAG, "Entering main loop - system will continue sleep/wake cycles");
+    while (1) {
+        // Let the system handle sleep/wake cycles automatically
+        vTaskDelay(pdMS_TO_TICKS(1000)); // Check every second
     }
 }

@@ -55,16 +55,51 @@ static esp_err_t bmi160_spi_read(bmi160_handle_t h, uint8_t reg, uint8_t *data, 
 {
     bmi160_handle_int_t *handle = (bmi160_handle_int_t*)h;
     uint8_t header = bmi160_spi_make_addr(reg, true);
+    
+    // For large reads (like FIFO), use dynamic allocation
+    if (len > 16) {
+        uint8_t *buf_tx = malloc(len + 1);
+        uint8_t *buf_rx = malloc(len + 1);
+        if (!buf_tx || !buf_rx) {
+            free(buf_tx);
+            free(buf_rx);
+            return ESP_ERR_NO_MEM;
+        }
+        
+        memset(buf_tx, 0, len + 1);
+        memset(buf_rx, 0, len + 1);
+        buf_tx[0] = header;
+        
+        spi_transaction_t t = {
+            .flags = 0,
+            .length = (len + 1) * 8,
+            .tx_buffer = buf_tx,
+            .rx_buffer = buf_rx,
+        };
+        
+        // Add timeout for large transactions
+        esp_err_t err = spi_device_transmit(handle->spi, &t);
+        if (err == ESP_OK && len) {
+            memcpy(data, &buf_rx[1], len);
+        }
+        
+        free(buf_tx);
+        free(buf_rx);
+        return err;
+    }
+    
+    // For small reads, use stack buffers
+    uint8_t buf_tx[1 + 16] = {0};
+    uint8_t buf_rx[1 + 16] = {0};
+    buf_tx[0] = header;
+    
     spi_transaction_t t = {
         .flags = 0,
         .length = (len + 1) * 8,
+        .tx_buffer = buf_tx,
+        .rx_buffer = buf_rx,
     };
-    uint8_t buf_tx[1 + 16] = {0};
-    uint8_t buf_rx[1 + 16] = {0};
-    if (len > 16) return ESP_ERR_INVALID_ARG;
-    buf_tx[0] = header;
-    t.tx_buffer = buf_tx;
-    t.rx_buffer = buf_rx;
+    
     esp_err_t err = spi_device_transmit(handle->spi, &t);
     if (err != ESP_OK) return err;
     if (len) memcpy(data, &buf_rx[1], len);
@@ -173,6 +208,14 @@ esp_err_t bmi160_init_default(bmi160_handle_t handle)
     // Latch duration 80ms
     uint8_t int_latch = 0x0B; // latch 80ms
     ESP_RETURN_ON_ERROR(bmi160_spi_write(handle, BMI160_REG_INT_LATCH, &int_latch, 1), TAG_BMI160, "int latch");
+
+    // Configure FIFO: Enable accelerometer and gyroscope FIFO with header mode
+    ESP_RETURN_ON_ERROR(bmi160_set_accel_fifo_enabled(handle, true), TAG_BMI160, "accel fifo enable");
+    ESP_RETURN_ON_ERROR(bmi160_set_gyro_fifo_enabled(handle, false), TAG_BMI160, "gyro fifo enable");
+    ESP_RETURN_ON_ERROR(bmi160_set_fifo_header_mode_enabled(handle, false), TAG_BMI160, "fifo header enable");
+    
+    // Enable FIFO buffer full interrupt (optional)
+    ESP_RETURN_ON_ERROR(bmi160_set_int_fifo_buffer_full_enabled(handle, true), TAG_BMI160, "fifo full int enable");
 
     return ESP_OK;
 }
@@ -381,6 +424,729 @@ void bmi160_destroy(bmi160_handle_t handle)
     bmi160_handle_int_t *h = (bmi160_handle_int_t*)handle;
     spi_bus_remove_device(h->spi);
     free(h);
+}
+
+// Helper functions for register bit operations
+static esp_err_t bmi160_reg_read_bits(bmi160_handle_t handle, uint8_t reg, uint8_t *data, uint8_t pos, uint8_t len)
+{
+    uint8_t reg_data;
+    esp_err_t err = bmi160_spi_read(handle, reg, &reg_data, 1);
+    if (err != ESP_OK) return err;
+    
+    uint8_t mask = ((1 << len) - 1) << pos;
+    *data = (reg_data & mask) >> pos;
+    return ESP_OK;
+}
+
+static esp_err_t bmi160_reg_write_bits(bmi160_handle_t handle, uint8_t reg, uint8_t data, uint8_t pos, uint8_t len)
+{
+    uint8_t reg_data;
+    esp_err_t err = bmi160_spi_read(handle, reg, &reg_data, 1);
+    if (err != ESP_OK) return err;
+    
+    uint8_t mask = ((1 << len) - 1) << pos;
+    data <<= pos;
+    data &= mask;
+    reg_data &= ~mask;
+    reg_data |= data;
+    
+    return bmi160_spi_write(handle, reg, &reg_data, 1);
+}
+
+// Device ID and connection test
+esp_err_t bmi160_get_device_id(bmi160_handle_t handle, uint8_t *device_id)
+{
+    if (!handle || !device_id) return ESP_ERR_INVALID_ARG;
+    return bmi160_spi_read(handle, BMI160_REG_CHIP_ID, device_id, 1);
+}
+
+esp_err_t bmi160_test_connection(bmi160_handle_t handle, bool *is_connected)
+{
+    if (!handle || !is_connected) return ESP_ERR_INVALID_ARG;
+    uint8_t device_id;
+    esp_err_t err = bmi160_get_device_id(handle, &device_id);
+    if (err != ESP_OK) return err;
+    *is_connected = (device_id == 0xD1);
+    return ESP_OK;
+}
+
+// Data rate configuration
+esp_err_t bmi160_get_gyro_rate(bmi160_handle_t handle, uint8_t *rate)
+{
+    if (!handle || !rate) return ESP_ERR_INVALID_ARG;
+    return bmi160_reg_read_bits(handle, BMI160_REG_GYR_CONF, rate, BMI160_GYRO_RATE_SEL_BIT, BMI160_GYRO_RATE_SEL_LEN);
+}
+
+esp_err_t bmi160_set_gyro_rate(bmi160_handle_t handle, uint8_t rate)
+{
+    if (!handle) return ESP_ERR_INVALID_ARG;
+    return bmi160_reg_write_bits(handle, BMI160_REG_GYR_CONF, rate, BMI160_GYRO_RATE_SEL_BIT, BMI160_GYRO_RATE_SEL_LEN);
+}
+
+esp_err_t bmi160_get_accel_rate(bmi160_handle_t handle, uint8_t *rate)
+{
+    if (!handle || !rate) return ESP_ERR_INVALID_ARG;
+    return bmi160_reg_read_bits(handle, BMI160_REG_ACC_CONF, rate, BMI160_ACCEL_RATE_SEL_BIT, BMI160_ACCEL_RATE_SEL_LEN);
+}
+
+esp_err_t bmi160_set_accel_rate(bmi160_handle_t handle, uint8_t rate)
+{
+    if (!handle) return ESP_ERR_INVALID_ARG;
+    return bmi160_reg_write_bits(handle, BMI160_REG_ACC_CONF, rate, BMI160_ACCEL_RATE_SEL_BIT, BMI160_ACCEL_RATE_SEL_LEN);
+}
+
+// Digital Low-Pass Filter configuration
+esp_err_t bmi160_get_gyro_dlpf_mode(bmi160_handle_t handle, uint8_t *mode)
+{
+    if (!handle || !mode) return ESP_ERR_INVALID_ARG;
+    return bmi160_reg_read_bits(handle, BMI160_REG_GYR_CONF, mode, BMI160_GYRO_DLPF_SEL_BIT, BMI160_GYRO_DLPF_SEL_LEN);
+}
+
+esp_err_t bmi160_set_gyro_dlpf_mode(bmi160_handle_t handle, uint8_t mode)
+{
+    if (!handle) return ESP_ERR_INVALID_ARG;
+    return bmi160_reg_write_bits(handle, BMI160_REG_GYR_CONF, mode, BMI160_GYRO_DLPF_SEL_BIT, BMI160_GYRO_DLPF_SEL_LEN);
+}
+
+esp_err_t bmi160_get_accel_dlpf_mode(bmi160_handle_t handle, uint8_t *mode)
+{
+    if (!handle || !mode) return ESP_ERR_INVALID_ARG;
+    return bmi160_reg_read_bits(handle, BMI160_REG_ACC_CONF, mode, BMI160_ACCEL_DLPF_SEL_BIT, BMI160_ACCEL_DLPF_SEL_LEN);
+}
+
+esp_err_t bmi160_set_accel_dlpf_mode(bmi160_handle_t handle, uint8_t mode)
+{
+    if (!handle) return ESP_ERR_INVALID_ARG;
+    return bmi160_reg_write_bits(handle, BMI160_REG_ACC_CONF, mode, BMI160_ACCEL_DLPF_SEL_BIT, BMI160_ACCEL_DLPF_SEL_LEN);
+}
+
+// Range configuration
+esp_err_t bmi160_get_full_scale_gyro_range(bmi160_handle_t handle, uint8_t *range)
+{
+    if (!handle || !range) return ESP_ERR_INVALID_ARG;
+    return bmi160_reg_read_bits(handle, BMI160_REG_GYR_RANGE, range, BMI160_GYRO_RANGE_SEL_BIT, BMI160_GYRO_RANGE_SEL_LEN);
+}
+
+esp_err_t bmi160_set_full_scale_gyro_range(bmi160_handle_t handle, uint8_t range)
+{
+    if (!handle) return ESP_ERR_INVALID_ARG;
+    return bmi160_reg_write_bits(handle, BMI160_REG_GYR_RANGE, range, BMI160_GYRO_RANGE_SEL_BIT, BMI160_GYRO_RANGE_SEL_LEN);
+}
+
+esp_err_t bmi160_get_full_scale_accel_range(bmi160_handle_t handle, uint8_t *range)
+{
+    if (!handle || !range) return ESP_ERR_INVALID_ARG;
+    return bmi160_reg_read_bits(handle, BMI160_REG_ACC_RANGE, range, BMI160_ACCEL_RANGE_SEL_BIT, BMI160_ACCEL_RANGE_SEL_LEN);
+}
+
+esp_err_t bmi160_set_full_scale_accel_range(bmi160_handle_t handle, uint8_t range)
+{
+    if (!handle) return ESP_ERR_INVALID_ARG;
+    return bmi160_reg_write_bits(handle, BMI160_REG_ACC_RANGE, range, BMI160_ACCEL_RANGE_SEL_BIT, BMI160_ACCEL_RANGE_SEL_LEN);
+}
+
+// Individual sensor reading functions
+esp_err_t bmi160_get_acceleration_x(bmi160_handle_t handle, int16_t *x)
+{
+    if (!handle || !x) return ESP_ERR_INVALID_ARG;
+    uint8_t buf[2];
+    esp_err_t err = bmi160_spi_read(handle, BMI160_REG_DATA_ACC_X_L, buf, 2);
+    if (err != ESP_OK) return err;
+    *x = (int16_t)((buf[1] << 8) | buf[0]);
+    return ESP_OK;
+}
+
+esp_err_t bmi160_get_acceleration_y(bmi160_handle_t handle, int16_t *y)
+{
+    if (!handle || !y) return ESP_ERR_INVALID_ARG;
+    uint8_t buf[2];
+    esp_err_t err = bmi160_spi_read(handle, BMI160_REG_DATA_ACC_Y_L, buf, 2);
+    if (err != ESP_OK) return err;
+    *y = (int16_t)((buf[1] << 8) | buf[0]);
+    return ESP_OK;
+}
+
+esp_err_t bmi160_get_acceleration_z(bmi160_handle_t handle, int16_t *z)
+{
+    if (!handle || !z) return ESP_ERR_INVALID_ARG;
+    uint8_t buf[2];
+    esp_err_t err = bmi160_spi_read(handle, BMI160_REG_DATA_ACC_Z_L, buf, 2);
+    if (err != ESP_OK) return err;
+    *z = (int16_t)((buf[1] << 8) | buf[0]);
+    return ESP_OK;
+}
+
+esp_err_t bmi160_get_rotation_x(bmi160_handle_t handle, int16_t *x)
+{
+    if (!handle || !x) return ESP_ERR_INVALID_ARG;
+    uint8_t buf[2];
+    esp_err_t err = bmi160_spi_read(handle, BMI160_REG_DATA_GYR_X_L, buf, 2);
+    if (err != ESP_OK) return err;
+    *x = (int16_t)((buf[1] << 8) | buf[0]);
+    return ESP_OK;
+}
+
+esp_err_t bmi160_get_rotation_y(bmi160_handle_t handle, int16_t *y)
+{
+    if (!handle || !y) return ESP_ERR_INVALID_ARG;
+    uint8_t buf[2];
+    esp_err_t err = bmi160_spi_read(handle, BMI160_REG_DATA_GYR_Y_L, buf, 2);
+    if (err != ESP_OK) return err;
+    *y = (int16_t)((buf[1] << 8) | buf[0]);
+    return ESP_OK;
+}
+
+esp_err_t bmi160_get_rotation_z(bmi160_handle_t handle, int16_t *z)
+{
+    if (!handle || !z) return ESP_ERR_INVALID_ARG;
+    uint8_t buf[2];
+    esp_err_t err = bmi160_spi_read(handle, BMI160_REG_DATA_GYR_Z_L, buf, 2);
+    if (err != ESP_OK) return err;
+    *z = (int16_t)((buf[1] << 8) | buf[0]);
+    return ESP_OK;
+}
+
+esp_err_t bmi160_get_temperature(bmi160_handle_t handle, int16_t *temperature)
+{
+    if (!handle || !temperature) return ESP_ERR_INVALID_ARG;
+    uint8_t buf[2];
+    esp_err_t err = bmi160_spi_read(handle, BMI160_REG_TEMP_L, buf, 2);
+    if (err != ESP_OK) return err;
+    *temperature = (int16_t)((buf[1] << 8) | buf[0]);
+    return ESP_OK;
+}
+
+// Register access functions
+esp_err_t bmi160_get_register(bmi160_handle_t handle, uint8_t reg, uint8_t *data)
+{
+    if (!handle || !data) return ESP_ERR_INVALID_ARG;
+    return bmi160_spi_read(handle, reg, data, 1);
+}
+
+esp_err_t bmi160_set_register(bmi160_handle_t handle, uint8_t reg, uint8_t data)
+{
+    if (!handle) return ESP_ERR_INVALID_ARG;
+    return bmi160_spi_write(handle, reg, &data, 1);
+}
+
+// Calibration functions
+esp_err_t bmi160_auto_calibrate_gyro_offset(bmi160_handle_t handle)
+{
+    if (!handle) return ESP_ERR_INVALID_ARG;
+    
+    uint8_t foc_conf = (1 << BMI160_FOC_GYR_EN);
+    esp_err_t err = bmi160_spi_write(handle, BMI160_REG_FOC_CONF, &foc_conf, 1);
+    if (err != ESP_OK) return err;
+    
+    uint8_t cmd = BMI160_CMD_START_FOC;
+    err = bmi160_spi_write(handle, BMI160_REG_CMD, &cmd, 1);
+    if (err != ESP_OK) return err;
+    
+    // Wait for FOC to complete
+    uint8_t status;
+    for (int i = 0; i < 250; i++) {
+        err = bmi160_spi_read(handle, BMI160_REG_STATUS, &status, 1);
+        if (err != ESP_OK) return err;
+        if (status & (1 << BMI160_STATUS_FOC_RDY)) return ESP_OK;
+        vTaskDelay(pdMS_TO_TICKS(1));
+    }
+    return ESP_ERR_TIMEOUT;
+}
+
+esp_err_t bmi160_auto_calibrate_x_accel_offset(bmi160_handle_t handle, int target)
+{
+    if (!handle) return ESP_ERR_INVALID_ARG;
+    
+    uint8_t foc_conf;
+    if (target == 1)
+        foc_conf = (0x1 << BMI160_FOC_ACC_X_BIT);
+    else if (target == -1)
+        foc_conf = (0x2 << BMI160_FOC_ACC_X_BIT);
+    else if (target == 0)
+        foc_conf = (0x3 << BMI160_FOC_ACC_X_BIT);
+    else
+        return ESP_ERR_INVALID_ARG;
+    
+    esp_err_t err = bmi160_spi_write(handle, BMI160_REG_FOC_CONF, &foc_conf, 1);
+    if (err != ESP_OK) return err;
+    
+    uint8_t cmd = BMI160_CMD_START_FOC;
+    err = bmi160_spi_write(handle, BMI160_REG_CMD, &cmd, 1);
+    if (err != ESP_OK) return err;
+    
+    // Wait for FOC to complete
+    uint8_t status;
+    for (int i = 0; i < 250; i++) {
+        err = bmi160_spi_read(handle, BMI160_REG_STATUS, &status, 1);
+        if (err != ESP_OK) return err;
+        if (status & (1 << BMI160_STATUS_FOC_RDY)) return ESP_OK;
+        vTaskDelay(pdMS_TO_TICKS(1));
+    }
+    return ESP_ERR_TIMEOUT;
+}
+
+esp_err_t bmi160_auto_calibrate_y_accel_offset(bmi160_handle_t handle, int target)
+{
+    if (!handle) return ESP_ERR_INVALID_ARG;
+    
+    uint8_t foc_conf;
+    if (target == 1)
+        foc_conf = (0x1 << BMI160_FOC_ACC_Y_BIT);
+    else if (target == -1)
+        foc_conf = (0x2 << BMI160_FOC_ACC_Y_BIT);
+    else if (target == 0)
+        foc_conf = (0x3 << BMI160_FOC_ACC_Y_BIT);
+    else
+        return ESP_ERR_INVALID_ARG;
+    
+    esp_err_t err = bmi160_spi_write(handle, BMI160_REG_FOC_CONF, &foc_conf, 1);
+    if (err != ESP_OK) return err;
+    
+    uint8_t cmd = BMI160_CMD_START_FOC;
+    err = bmi160_spi_write(handle, BMI160_REG_CMD, &cmd, 1);
+    if (err != ESP_OK) return err;
+    
+    // Wait for FOC to complete
+    uint8_t status;
+    for (int i = 0; i < 250; i++) {
+        err = bmi160_spi_read(handle, BMI160_REG_STATUS, &status, 1);
+        if (err != ESP_OK) return err;
+        if (status & (1 << BMI160_STATUS_FOC_RDY)) return ESP_OK;
+        vTaskDelay(pdMS_TO_TICKS(1));
+    }
+    return ESP_ERR_TIMEOUT;
+}
+
+esp_err_t bmi160_auto_calibrate_z_accel_offset(bmi160_handle_t handle, int target)
+{
+    if (!handle) return ESP_ERR_INVALID_ARG;
+    
+    uint8_t foc_conf;
+    if (target == 1)
+        foc_conf = (0x1 << BMI160_FOC_ACC_Z_BIT);
+    else if (target == -1)
+        foc_conf = (0x2 << BMI160_FOC_ACC_Z_BIT);
+    else if (target == 0)
+        foc_conf = (0x3 << BMI160_FOC_ACC_Z_BIT);
+    else
+        return ESP_ERR_INVALID_ARG;
+    
+    esp_err_t err = bmi160_spi_write(handle, BMI160_REG_FOC_CONF, &foc_conf, 1);
+    if (err != ESP_OK) return err;
+    
+    uint8_t cmd = BMI160_CMD_START_FOC;
+    err = bmi160_spi_write(handle, BMI160_REG_CMD, &cmd, 1);
+    if (err != ESP_OK) return err;
+    
+    // Wait for FOC to complete
+    uint8_t status;
+    for (int i = 0; i < 250; i++) {
+        err = bmi160_spi_read(handle, BMI160_REG_STATUS, &status, 1);
+        if (err != ESP_OK) return err;
+        if (status & (1 << BMI160_STATUS_FOC_RDY)) return ESP_OK;
+        vTaskDelay(pdMS_TO_TICKS(1));
+    }
+    return ESP_ERR_TIMEOUT;
+}
+
+// Interrupt status functions
+esp_err_t bmi160_get_int_status0(bmi160_handle_t handle, uint8_t *status)
+{
+    if (!handle || !status) return ESP_ERR_INVALID_ARG;
+    return bmi160_spi_read(handle, BMI160_REG_INT_STATUS_0, status, 1);
+}
+
+esp_err_t bmi160_get_int_status1(bmi160_handle_t handle, uint8_t *status)
+{
+    if (!handle || !status) return ESP_ERR_INVALID_ARG;
+    return bmi160_spi_read(handle, BMI160_REG_INT_STATUS_1, status, 1);
+}
+
+esp_err_t bmi160_get_int_status2(bmi160_handle_t handle, uint8_t *status)
+{
+    if (!handle || !status) return ESP_ERR_INVALID_ARG;
+    return bmi160_spi_read(handle, BMI160_REG_INT_STATUS_2, status, 1);
+}
+
+esp_err_t bmi160_get_int_status3(bmi160_handle_t handle, uint8_t *status)
+{
+    if (!handle || !status) return ESP_ERR_INVALID_ARG;
+    return bmi160_spi_read(handle, BMI160_REG_INT_STATUS_3, status, 1);
+}
+
+esp_err_t bmi160_get_int_freefall_status(bmi160_handle_t handle, bool *status)
+{
+    if (!handle || !status) return ESP_ERR_INVALID_ARG;
+    uint8_t int_status;
+    esp_err_t err = bmi160_spi_read(handle, BMI160_REG_INT_STATUS_1, &int_status, 1);
+    if (err != ESP_OK) return err;
+    *status = (int_status & (1 << BMI160_LOW_G_INT_BIT)) != 0;
+    return ESP_OK;
+}
+
+esp_err_t bmi160_get_int_shock_status(bmi160_handle_t handle, bool *status)
+{
+    if (!handle || !status) return ESP_ERR_INVALID_ARG;
+    uint8_t int_status;
+    esp_err_t err = bmi160_spi_read(handle, BMI160_REG_INT_STATUS_1, &int_status, 1);
+    if (err != ESP_OK) return err;
+    *status = (int_status & (1 << BMI160_HIGH_G_INT_BIT)) != 0;
+    return ESP_OK;
+}
+
+esp_err_t bmi160_get_int_step_status(bmi160_handle_t handle, bool *status)
+{
+    if (!handle || !status) return ESP_ERR_INVALID_ARG;
+    uint8_t int_status;
+    esp_err_t err = bmi160_spi_read(handle, BMI160_REG_INT_STATUS_0, &int_status, 1);
+    if (err != ESP_OK) return err;
+    *status = (int_status & (1 << BMI160_STEP_INT_BIT)) != 0;
+    return ESP_OK;
+}
+
+esp_err_t bmi160_get_int_motion_status(bmi160_handle_t handle, bool *status)
+{
+    if (!handle || !status) return ESP_ERR_INVALID_ARG;
+    uint8_t int_status;
+    esp_err_t err = bmi160_spi_read(handle, BMI160_REG_INT_STATUS_0, &int_status, 1);
+    if (err != ESP_OK) return err;
+    *status = (int_status & (1 << BMI160_ANYMOTION_INT_BIT)) != 0;
+    return ESP_OK;
+}
+
+esp_err_t bmi160_get_int_tap_status(bmi160_handle_t handle, bool *status)
+{
+    if (!handle || !status) return ESP_ERR_INVALID_ARG;
+    uint8_t int_status;
+    esp_err_t err = bmi160_spi_read(handle, BMI160_REG_INT_STATUS_0, &int_status, 1);
+    if (err != ESP_OK) return err;
+    *status = (int_status & (1 << BMI160_S_TAP_INT_BIT)) != 0;
+    return ESP_OK;
+}
+
+esp_err_t bmi160_get_int_double_tap_status(bmi160_handle_t handle, bool *status)
+{
+    if (!handle || !status) return ESP_ERR_INVALID_ARG;
+    uint8_t int_status;
+    esp_err_t err = bmi160_spi_read(handle, BMI160_REG_INT_STATUS_0, &int_status, 1);
+    if (err != ESP_OK) return err;
+    *status = (int_status & (1 << BMI160_D_TAP_INT_BIT)) != 0;
+    return ESP_OK;
+}
+
+// FIFO functions
+esp_err_t bmi160_reset_fifo(bmi160_handle_t handle)
+{
+    if (!handle) return ESP_ERR_INVALID_ARG;
+    uint8_t cmd = BMI160_CMD_FIFO_FLUSH;
+    return bmi160_spi_write(handle, BMI160_REG_CMD, &cmd, 1);
+}
+
+esp_err_t bmi160_get_fifo_count(bmi160_handle_t handle, uint16_t *count)
+{
+    if (!handle || !count) return ESP_ERR_INVALID_ARG;
+    uint8_t buf[2];
+    esp_err_t err = bmi160_spi_read(handle, BMI160_REG_FIFO_LENGTH_0, buf, 2);
+    if (err != ESP_OK) return err;
+    *count = (uint16_t)((buf[1] << 8) | buf[0]);
+    return ESP_OK;
+}
+
+esp_err_t bmi160_get_fifo_bytes(bmi160_handle_t handle, uint8_t *data, uint16_t length)
+{
+    if (!handle || !data || length == 0) return ESP_ERR_INVALID_ARG;
+    return bmi160_spi_read(handle, BMI160_REG_FIFO_DATA, data, length);
+}
+
+// Step detection functions
+esp_err_t bmi160_get_step_count(bmi160_handle_t handle, uint16_t *count)
+{
+    if (!handle || !count) return ESP_ERR_INVALID_ARG;
+    uint8_t buf[2];
+    esp_err_t err = bmi160_spi_read(handle, BMI160_REG_STEP_CNT_L, buf, 2);
+    if (err != ESP_OK) return err;
+    *count = (uint16_t)((buf[1] << 8) | buf[0]);
+    return ESP_OK;
+}
+
+esp_err_t bmi160_reset_step_count(bmi160_handle_t handle)
+{
+    if (!handle) return ESP_ERR_INVALID_ARG;
+    uint8_t cmd = BMI160_CMD_STEP_CNT_CLR;
+    return bmi160_spi_write(handle, BMI160_REG_CMD, &cmd, 1);
+}
+
+esp_err_t bmi160_reset_interrupt(bmi160_handle_t handle)
+{
+    if (!handle) return ESP_ERR_INVALID_ARG;
+    uint8_t cmd = BMI160_CMD_INT_RESET;
+    return bmi160_spi_write(handle, BMI160_REG_CMD, &cmd, 1);
+}
+
+// FIFO configuration functions
+esp_err_t bmi160_set_gyro_fifo_enabled(bmi160_handle_t handle, bool enabled)
+{
+    if (!handle) return ESP_ERR_INVALID_ARG;
+    return bmi160_reg_write_bits(handle, BMI160_REG_FIFO_CONFIG_1, enabled ? 1 : 0, BMI160_FIFO_GYR_EN_BIT, 1);
+}
+
+esp_err_t bmi160_get_gyro_fifo_enabled(bmi160_handle_t handle, bool *enabled)
+{
+    if (!handle || !enabled) return ESP_ERR_INVALID_ARG;
+    uint8_t reg_val;
+    esp_err_t err = bmi160_reg_read_bits(handle, BMI160_REG_FIFO_CONFIG_1, &reg_val, BMI160_FIFO_GYR_EN_BIT, 1);
+    if (err != ESP_OK) return err;
+    *enabled = (reg_val != 0);
+    return ESP_OK;
+}
+
+esp_err_t bmi160_set_accel_fifo_enabled(bmi160_handle_t handle, bool enabled)
+{
+    if (!handle) return ESP_ERR_INVALID_ARG;
+    return bmi160_reg_write_bits(handle, BMI160_REG_FIFO_CONFIG_1, enabled ? 1 : 0, BMI160_FIFO_ACC_EN_BIT, 1);
+}
+
+esp_err_t bmi160_get_accel_fifo_enabled(bmi160_handle_t handle, bool *enabled)
+{
+    if (!handle || !enabled) return ESP_ERR_INVALID_ARG;
+    uint8_t reg_val;
+    esp_err_t err = bmi160_reg_read_bits(handle, BMI160_REG_FIFO_CONFIG_1, &reg_val, BMI160_FIFO_ACC_EN_BIT, 1);
+    if (err != ESP_OK) return err;
+    *enabled = (reg_val != 0);
+    return ESP_OK;
+}
+
+esp_err_t bmi160_set_fifo_header_mode_enabled(bmi160_handle_t handle, bool enabled)
+{
+    if (!handle) return ESP_ERR_INVALID_ARG;
+    return bmi160_reg_write_bits(handle, BMI160_REG_FIFO_CONFIG_1, enabled ? 1 : 0, BMI160_FIFO_HEADER_EN_BIT, 1);
+}
+
+esp_err_t bmi160_get_fifo_header_mode_enabled(bmi160_handle_t handle, bool *enabled)
+{
+    if (!handle || !enabled) return ESP_ERR_INVALID_ARG;
+    uint8_t reg_val;
+    esp_err_t err = bmi160_reg_read_bits(handle, BMI160_REG_FIFO_CONFIG_1, &reg_val, BMI160_FIFO_HEADER_EN_BIT, 1);
+    if (err != ESP_OK) return err;
+    *enabled = (reg_val != 0);
+    return ESP_OK;
+}
+
+esp_err_t bmi160_set_int_fifo_buffer_full_enabled(bmi160_handle_t handle, bool enabled)
+{
+    if (!handle) return ESP_ERR_INVALID_ARG;
+    return bmi160_reg_write_bits(handle, BMI160_REG_INT_EN_1, enabled ? 1 : 0, BMI160_FFULL_EN_BIT, 1);
+}
+
+esp_err_t bmi160_get_int_fifo_buffer_full_enabled(bmi160_handle_t handle, bool *enabled)
+{
+    if (!handle || !enabled) return ESP_ERR_INVALID_ARG;
+    uint8_t reg_val;
+    esp_err_t err = bmi160_reg_read_bits(handle, BMI160_REG_INT_EN_1, &reg_val, BMI160_FFULL_EN_BIT, 1);
+    if (err != ESP_OK) return err;
+    *enabled = (reg_val != 0);
+    return ESP_OK;
+}
+
+esp_err_t bmi160_set_int_data_ready_enabled(bmi160_handle_t handle, bool enabled)
+{
+    if (!handle) return ESP_ERR_INVALID_ARG;
+    return bmi160_reg_write_bits(handle, BMI160_REG_INT_EN_1, enabled ? 1 : 0, BMI160_DRDY_EN_BIT, 1);
+}
+
+esp_err_t bmi160_get_int_data_ready_enabled(bmi160_handle_t handle, bool *enabled)
+{
+    if (!handle || !enabled) return ESP_ERR_INVALID_ARG;
+    uint8_t reg_val;
+    esp_err_t err = bmi160_reg_read_bits(handle, BMI160_REG_INT_EN_1, &reg_val, BMI160_DRDY_EN_BIT, 1);
+    if (err != ESP_OK) return err;
+    *enabled = (reg_val != 0);
+    return ESP_OK;
+}
+
+// FIFO headerless mode functions
+esp_err_t bmi160_read_fifo_headerless_accel(bmi160_handle_t handle, int16_t *accel_data, uint16_t *sample_count)
+{
+    if (!handle || !accel_data || !sample_count) return ESP_ERR_INVALID_ARG;
+    
+    // Initialize output parameters
+    *sample_count = 0;
+    
+    uint16_t fifo_count = 0;
+    esp_err_t err = bmi160_get_fifo_count(handle, &fifo_count);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG_BMI160, "Failed to get FIFO count: %s", esp_err_to_name(err));
+        return err;
+    }
+    
+    // Check if we have enough data for at least one accelerometer frame
+    if (fifo_count < BMI160_ACCEL_FRAME_SIZE) {
+        ESP_LOGD(TAG_BMI160, "Not enough FIFO data: %d bytes (need %d)", fifo_count, BMI160_ACCEL_FRAME_SIZE);
+        return ESP_OK;
+    }
+    
+    // Limit read size to prevent buffer overflow
+    uint16_t max_samples = 100; // Maximum samples to read at once
+    uint16_t max_bytes = max_samples * BMI160_ACCEL_FRAME_SIZE;
+    if (fifo_count > max_bytes) {
+        ESP_LOGW(TAG_BMI160, "FIFO count (%d) exceeds max read size (%d), limiting read", fifo_count, max_bytes);
+        fifo_count = max_bytes;
+    }
+    
+    // Ensure we read complete frames only
+    uint16_t bytes_to_read = (fifo_count / BMI160_ACCEL_FRAME_SIZE) * BMI160_ACCEL_FRAME_SIZE;
+    if (bytes_to_read == 0) {
+        ESP_LOGW(TAG_BMI160, "No complete frames available in FIFO");
+        return ESP_OK;
+    }
+    
+    uint16_t expected_samples = bytes_to_read / BMI160_ACCEL_FRAME_SIZE;
+    ESP_LOGD(TAG_BMI160, "Reading %d bytes (%d samples) from FIFO", bytes_to_read, expected_samples);
+    
+    // Allocate buffer for FIFO data
+    uint8_t *fifo_buffer = malloc(bytes_to_read);
+    if (!fifo_buffer) return ESP_ERR_NO_MEM;
+    
+    // Read FIFO data
+    err = bmi160_get_fifo_bytes(handle, fifo_buffer, bytes_to_read);
+    if (err != ESP_OK) {
+        free(fifo_buffer);
+        return err;
+    }
+    
+    // Parse accelerometer data
+    uint16_t samples_parsed = 0;
+    for (uint16_t i = 0; i <= bytes_to_read - BMI160_ACCEL_FRAME_SIZE; i += BMI160_ACCEL_FRAME_SIZE) {
+        // Extract accelerometer data (little-endian format)
+        int16_t ax = (int16_t)((fifo_buffer[i + 1] << 8) | fifo_buffer[i + 0]);
+        int16_t ay = (int16_t)((fifo_buffer[i + 3] << 8) | fifo_buffer[i + 2]);
+        int16_t az = (int16_t)((fifo_buffer[i + 5] << 8) | fifo_buffer[i + 4]);
+        
+        // Basic validation: check for reasonable values (not all zeros or all 0xFF)
+        bool valid_sample = !((ax == 0 && ay == 0 && az == 0) || 
+                             (ax == -1 && ay == -1 && az == -1));
+        
+        if (valid_sample) {
+            // Store in output array (3 values per sample: x, y, z)
+            accel_data[samples_parsed * 3 + 0] = ax;
+            accel_data[samples_parsed * 3 + 1] = ay;
+            accel_data[samples_parsed * 3 + 2] = az;
+            samples_parsed++;
+        } else {
+            ESP_LOGW(TAG_BMI160, "Invalid accelerometer sample detected at offset %d: ax=%d, ay=%d, az=%d", 
+                     i, ax, ay, az);
+        }
+    }
+    
+    *sample_count = samples_parsed;
+    free(fifo_buffer);
+    
+    ESP_LOGI(TAG_BMI160, "Read %d accelerometer samples from FIFO (%d bytes)", samples_parsed, bytes_to_read);
+    return ESP_OK;
+}
+
+esp_err_t bmi160_read_fifo_headerless_accel_gyro(bmi160_handle_t handle, int16_t *accel_data, int16_t *gyro_data, uint16_t *sample_count)
+{
+    if (!handle || !accel_data || !gyro_data || !sample_count) return ESP_ERR_INVALID_ARG;
+    
+    uint16_t fifo_count = 0;
+    esp_err_t err = bmi160_get_fifo_count(handle, &fifo_count);
+    if (err != ESP_OK) return err;
+    
+    // Check if we have enough data for at least one accel+gyro frame
+    if (fifo_count < BMI160_ACCEL_GYRO_FRAME_SIZE) {
+        *sample_count = 0;
+        return ESP_OK;
+    }
+    
+    // Limit read size to prevent buffer overflow
+    uint16_t max_samples = 50; // Maximum samples to read at once
+    uint16_t max_bytes = max_samples * BMI160_ACCEL_GYRO_FRAME_SIZE;
+    if (fifo_count > max_bytes) {
+        fifo_count = max_bytes;
+    }
+    
+    // Ensure we read complete frames only
+    uint16_t bytes_to_read = (fifo_count / BMI160_ACCEL_GYRO_FRAME_SIZE) * BMI160_ACCEL_GYRO_FRAME_SIZE;
+    if (bytes_to_read == 0) {
+        *sample_count = 0;
+        return ESP_OK;
+    }
+    
+    // Allocate buffer for FIFO data
+    uint8_t *fifo_buffer = malloc(bytes_to_read);
+    if (!fifo_buffer) return ESP_ERR_NO_MEM;
+    
+    // Read FIFO data
+    err = bmi160_get_fifo_bytes(handle, fifo_buffer, bytes_to_read);
+    if (err != ESP_OK) {
+        free(fifo_buffer);
+        return err;
+    }
+    
+    // Parse accelerometer and gyroscope data
+    uint16_t samples_parsed = 0;
+    for (uint16_t i = 0; i <= bytes_to_read - BMI160_ACCEL_GYRO_FRAME_SIZE; i += BMI160_ACCEL_GYRO_FRAME_SIZE) {
+        // Extract accelerometer data (first 6 bytes)
+        int16_t ax = (int16_t)((fifo_buffer[i + 1] << 8) | fifo_buffer[i + 0]);
+        int16_t ay = (int16_t)((fifo_buffer[i + 3] << 8) | fifo_buffer[i + 2]);
+        int16_t az = (int16_t)((fifo_buffer[i + 5] << 8) | fifo_buffer[i + 4]);
+        
+        // Extract gyroscope data (next 6 bytes)
+        int16_t gx = (int16_t)((fifo_buffer[i + 7] << 8) | fifo_buffer[i + 6]);
+        int16_t gy = (int16_t)((fifo_buffer[i + 9] << 8) | fifo_buffer[i + 8]);
+        int16_t gz = (int16_t)((fifo_buffer[i + 11] << 8) | fifo_buffer[i + 10]);
+        
+        // Store in output arrays (3 values per sample: x, y, z)
+        accel_data[samples_parsed * 3 + 0] = ax;
+        accel_data[samples_parsed * 3 + 1] = ay;
+        accel_data[samples_parsed * 3 + 2] = az;
+        
+        gyro_data[samples_parsed * 3 + 0] = gx;
+        gyro_data[samples_parsed * 3 + 1] = gy;
+        gyro_data[samples_parsed * 3 + 2] = gz;
+        
+        samples_parsed++;
+    }
+    
+    *sample_count = samples_parsed;
+    free(fifo_buffer);
+    
+    ESP_LOGI(TAG_BMI160, "Read %d accel+gyro samples from FIFO (%d bytes)", samples_parsed, bytes_to_read);
+    return ESP_OK;
+}
+
+esp_err_t bmi160_init_headerless_mode(bmi160_handle_t handle, bool enable_accel, bool enable_gyro)
+{
+    if (!handle) return ESP_ERR_INVALID_ARG;
+    
+    ESP_LOGI(TAG_BMI160, "Initializing BMI160 for headerless FIFO mode (accel=%d, gyro=%d)", enable_accel, enable_gyro);
+    
+    // Disable header mode (RẤT QUAN TRỌNG - như bạn đã nhấn mạnh)
+    ESP_RETURN_ON_ERROR(bmi160_set_fifo_header_mode_enabled(handle, false), TAG_BMI160, "disable fifo header");
+    
+    // Configure FIFO for accelerometer
+    if (enable_accel) {
+        ESP_RETURN_ON_ERROR(bmi160_set_accel_fifo_enabled(handle, true), TAG_BMI160, "enable accel fifo");
+    } else {
+        ESP_RETURN_ON_ERROR(bmi160_set_accel_fifo_enabled(handle, false), TAG_BMI160, "disable accel fifo");
+    }
+    
+    // Configure FIFO for gyroscope
+    if (enable_gyro) {
+        ESP_RETURN_ON_ERROR(bmi160_set_gyro_fifo_enabled(handle, true), TAG_BMI160, "enable gyro fifo");
+    } else {
+        ESP_RETURN_ON_ERROR(bmi160_set_gyro_fifo_enabled(handle, false), TAG_BMI160, "disable gyro fifo");
+    }
+    
+    // Enable FIFO buffer full interrupt (optional)
+    ESP_RETURN_ON_ERROR(bmi160_set_int_fifo_buffer_full_enabled(handle, true), TAG_BMI160, "enable fifo full interrupt");
+    
+    // Flush FIFO to start fresh
+    ESP_RETURN_ON_ERROR(bmi160_reset_fifo(handle), TAG_BMI160, "flush fifo");
+    
+    ESP_LOGI(TAG_BMI160, "BMI160 headerless FIFO mode configured successfully");
+    return ESP_OK;
 }
 
 

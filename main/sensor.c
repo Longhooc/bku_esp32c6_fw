@@ -5,6 +5,7 @@
  */
 
 #include "sensor.h"
+#include "bmi160.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -19,6 +20,104 @@ static bmi160_handle_t s_sensor_handle = NULL;
 static bool s_sensor_initialized = false;
 
 /**
+ * @brief Arduino-style FIFO reading function - Wait for FIFO full
+ * 
+ * This function waits for FIFO buffer full interrupt before reading:
+ * 1. Wait for FIFO buffer full interrupt
+ * 2. Read FIFO data with bmi160_get_fifo_bytes() (equivalent to bmi.getFIFOBytes())
+ * 3. Parse data in 6-byte frames (accelerometer only)
+ */
+static void sensor_demo_headerless_fifo(bmi160_handle_t handle)
+{
+    // Buffer for FIFO data (equivalent to Arduino fifoBuffer)
+    uint8_t fifoBuffer[1024];
+    uint16_t fifoCount = 0;
+    uint32_t intStatus = 0;
+    
+    ESP_LOGI(TAG, "=== Arduino Style FIFO Reading (Wait for Full) ===");
+    
+    // 1. Wait for FIFO buffer full interrupt (with timeout)
+    ESP_LOGI(TAG, "Waiting for FIFO buffer full interrupt...");
+    // TickType_t startTime = xTaskGetTickCount();
+    // TickType_t timeout = pdMS_TO_TICKS(5000); // 5 second timeout
+    
+    // bool fifoFullDetected = false;
+    // while ((xTaskGetTickCount() - startTime) < timeout) {
+    //     esp_err_t err = bmi160_read_int_status(handle, &intStatus);
+    //     if (err == ESP_OK && (intStatus & 0x2000)) { // FIFO buffer full bit (bit 13)
+    //         fifoFullDetected = true;
+    //         ESP_LOGI(TAG, "FIFO buffer full interrupt detected! (0x%08lx)", (unsigned long)intStatus);
+    //         break;
+    //     }
+    //     vTaskDelay(pdMS_TO_TICKS(10)); // Check every 10ms
+    // }
+    
+    // if (!fifoFullDetected) {
+    //     ESP_LOGW(TAG, "FIFO buffer full timeout, reading current FIFO count");
+    // }
+    
+    // 2. Get FIFO count (equivalent to Arduino: fifoCount = bmi.getFIFOCount())
+    esp_err_t err = bmi160_get_fifo_count(handle, &fifoCount);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to get FIFO count: %s", esp_err_to_name(err));
+        return;
+    }
+    
+    ESP_LOGI(TAG, "FIFO count: %d bytes", fifoCount);
+    
+    // 3. Check if we have enough data for at least one frame (6 bytes)
+    if (fifoCount >= BMI160_ACCEL_FRAME_SIZE) {
+        
+        // Limit read size to buffer size
+        if (fifoCount > sizeof(fifoBuffer)) {
+            fifoCount = sizeof(fifoBuffer);
+        }
+        
+        // 4. Read FIFO data (equivalent to Arduino: bmi.getFIFOBytes(fifoBuffer, fifoCount))
+        err = bmi160_get_fifo_bytes(handle, fifoBuffer, fifoCount);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to read FIFO bytes: %s", esp_err_to_name(err));
+            return;
+        }
+        
+        ESP_LOGI(TAG, "Read %d bytes from FIFO", fifoCount);
+        
+        // 5. Parse data in the buffer (equivalent to Arduino parsing loop)
+        // Loop through buffer, jumping 6 bytes each time (1 frame)
+        for (uint16_t i = 0; i <= fifoCount - BMI160_ACCEL_FRAME_SIZE; i += BMI160_ACCEL_FRAME_SIZE) {
+            
+            // Get 6 bytes for 1 data frame
+            uint8_t ax_lsb = fifoBuffer[i + 0];
+            uint8_t ax_msb = fifoBuffer[i + 1];
+            uint8_t ay_lsb = fifoBuffer[i + 2];
+            uint8_t ay_msb = fifoBuffer[i + 3];
+            uint8_t az_lsb = fifoBuffer[i + 4];
+            uint8_t az_msb = fifoBuffer[i + 5];
+            
+            // ===== CREATE VARIABLES AND READ DATA =====
+            // Combine 2 8-bit bytes (LSB and MSB) into 1 16-bit variable
+            int16_t ax = (int16_t)((ax_msb << 8) | ax_lsb);
+            int16_t ay = (int16_t)((ay_msb << 8) | ay_lsb);
+            int16_t az = (int16_t)((az_msb << 8) | az_lsb);
+            // =========================================
+            
+            // 6. Print read data
+            ESP_LOGI(TAG, "Frame[%d]: ax=%d, ay=%d, az=%d", 
+                     i / BMI160_ACCEL_FRAME_SIZE, ax, ay, az);
+        }
+        
+        ESP_LOGI(TAG, "Parsed %d accelerometer frames from FIFO", fifoCount / BMI160_ACCEL_FRAME_SIZE);
+        
+        // 7. Flush FIFO after reading to prevent overflow
+        bmi160_reset_fifo(handle);
+        ESP_LOGI(TAG, "FIFO flushed after reading");
+        
+    } else {
+        ESP_LOGI(TAG, "Not enough data in FIFO (need at least %d bytes)", BMI160_ACCEL_FRAME_SIZE);
+    }
+}
+
+/**
  * @brief BMI160 polling task
  * 
  * This task continuously reads sensor data and logs it with proper unit conversion.
@@ -30,10 +129,18 @@ static void sensor_poll_task(void *pv)
     sensor_task_ctx_t *ctx = (sensor_task_ctx_t *)pv;
     bmi160_sample_t sample;
     uint32_t istat;
+    uint16_t fifo_count = 0;
+    uint8_t fifo_data[1024]; // Buffer for FIFO data
     
     ESP_LOGI(TAG, "Sensor polling task started");
     
     for (;;) {
+        // Demo headerless FIFO reading (Arduino style)
+        sensor_demo_headerless_fifo(ctx->handle);
+        
+        // Longer delay to allow FIFO to fill up completely
+        // vTaskDelay(pdMS_TO_TICKS(2000)); // 2 seconds delay
+        
         if (bmi160_read_sample(ctx->handle, &sample) == ESP_OK) {
             // Convert ACC raw -> mg (int64) with sign-aware rounding
             int64_t ax_mg = ((int64_t)sample.accel_x * (int64_t)ctx->acc_mg_per_lsb_x1000 + (sample.accel_x >= 0 ? 500 : -500)) / 1000;
@@ -85,8 +192,15 @@ static void sensor_poll_task(void *pv)
         // Check interrupt status
         if (bmi160_read_int_status(ctx->handle, &istat) == ESP_OK && istat) {
             ESP_LOGE("bmi160", "int_status=0x%08lx", (unsigned long)istat);
+            
+            // Check if FIFO buffer full interrupt is set (bit 13 = 0x2000)
+            if (istat & 0x2000) {
+                ESP_LOGW(TAG, "FIFO buffer full, flushing FIFO");
+                bmi160_reset_fifo(ctx->handle);
+            }
         }
         
+        // Main task delay (in addition to the 100ms delay above)
         vTaskDelay(pdMS_TO_TICKS(ctx->poll_interval_ms));
     }
 }
@@ -163,6 +277,15 @@ esp_err_t sensor_init_with_config(const sensor_config_t *config)
         return ret;
     }
     
+    // Configure for headerless FIFO mode (chỉ bật accelerometer, tắt gyroscope như yêu cầu)
+    ret = bmi160_init_headerless_mode(s_sensor_handle, true, false);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to configure headerless FIFO mode: %s", esp_err_to_name(ret));
+        bmi160_destroy(s_sensor_handle);
+        s_sensor_handle = NULL;
+        return ret;
+    }
+    
     // Allocate task context
     s_sensor_ctx = (sensor_task_ctx_t *)malloc(sizeof(sensor_task_ctx_t));
     if (s_sensor_ctx == NULL) {
@@ -219,7 +342,7 @@ esp_err_t sensor_init_with_config(const sensor_config_t *config)
     // Create sensor polling task
     BaseType_t task_ret = xTaskCreate(sensor_poll_task, 
                                     "sensor_poll", 
-                                    2048, 
+                                    20048, 
                                     s_sensor_ctx, 
                                     4, 
                                     NULL);
