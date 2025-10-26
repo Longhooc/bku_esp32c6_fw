@@ -118,9 +118,10 @@ static void sensor_demo_headerless_fifo(bmi160_handle_t handle)
 }
 
 /**
- * @brief BMI160 polling task
+ * @brief BMI160 polling task - Run once per wake up
  * 
- * This task continuously reads sensor data and logs it with proper unit conversion.
+ * This task reads sensor data once and then exits.
+ * It will be called again when device wakes up next time.
  * 
  * @param pv Task parameter (sensor_task_ctx_t*)
  */
@@ -132,11 +133,11 @@ static void sensor_poll_task(void *pv)
     uint16_t fifo_count = 0;
     uint8_t fifo_data[1024]; // Buffer for FIFO data
     
-    ESP_LOGI(TAG, "Sensor polling task started");
+    ESP_LOGI(TAG, "Sensor polling task started - single read mode");
     
     for (;;) {
         // Demo headerless FIFO reading (Arduino style)
-        sensor_demo_headerless_fifo(ctx->handle);
+        // sensor_demo_headerless_fifo(ctx->handle);
         
         // Longer delay to allow FIFO to fill up completely
         // vTaskDelay(pdMS_TO_TICKS(2000)); // 2 seconds delay

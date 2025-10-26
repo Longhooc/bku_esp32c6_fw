@@ -31,6 +31,9 @@
 #include "esp_crc.h"
 #include "espnow_example.h"
 #include "sensor.h"
+
+// Extern sensor handle
+extern bmi160_handle_t sensor_get_handle(void);
 #include "esp_sleep.h"
 #include "esp_pm.h"
 #include "esp_timer.h"
@@ -66,6 +69,7 @@ static void sleep_timer_callback(void* arg);
 static void enable_automatic_light_sleep(void);
 static void disable_automatic_light_sleep(void);
 static esp_err_t create_sleep_timer(void);
+static void example_sensor_task_wrapper(void* arg);
 
 
 /* WiFi should start before using ESPNOW */
@@ -116,6 +120,12 @@ static void sleep_device(void)
     ESP_LOGI(TAG, "Woke up from light sleep");
     is_sleep_mode = false;
     
+    // Run sensor task once after wake up
+    if (sensor_initialized) {
+        ESP_LOGI(TAG, "Creating sensor task after wake up");
+        xTaskCreate(example_sensor_task_wrapper, "sensor_wake", 20048, NULL, 4, NULL);
+    }
+    
     // Recreate timer for next sleep cycle
     ESP_LOGI(TAG, "Recreating timer for next sleep cycle");
     esp_err_t ret = create_sleep_timer();
@@ -158,6 +168,53 @@ static esp_err_t create_sleep_timer(void)
     return ESP_OK;
 }
 
+// Wrapper function for sensor task that runs on each wake up
+static void example_sensor_task_wrapper(void* arg)
+{
+    bmi160_handle_t handle = sensor_get_handle();
+    if (handle == NULL) {
+        ESP_LOGE(TAG, "Cannot get sensor handle");
+        return;
+    }
+    
+    ESP_LOGI(TAG, "Running sensor task for this wake cycle");
+    
+    // Read FIFO data using Arduino-style function
+    uint8_t fifoBuffer[1024];
+    uint16_t fifoCount = 0;
+    
+    if (bmi160_get_fifo_count(handle, &fifoCount) == ESP_OK) {
+        ESP_LOGI(TAG, "FIFO count: %d bytes", fifoCount);
+        vTaskDelay(pdMS_TO_TICKS(100));
+        if (fifoCount >= 6) { // At least one frame
+            uint16_t bytesToRead = (fifoCount > sizeof(fifoBuffer)) ? sizeof(fifoBuffer) : fifoCount;
+            bytesToRead = (bytesToRead / 6) * 6; // Read complete frames only
+            
+            if (bmi160_get_fifo_bytes(handle, fifoBuffer, bytesToRead) == ESP_OK) {
+                ESP_LOGI(TAG, "Read %d bytes from FIFO, parsing data...", bytesToRead);
+                
+                // Parse frames
+                for (uint16_t i = 0; i <= bytesToRead - 6; i += 6) {
+                    int16_t ax = (int16_t)((fifoBuffer[i + 1] << 8) | fifoBuffer[i + 0]);
+                    int16_t ay = (int16_t)((fifoBuffer[i + 3] << 8) | fifoBuffer[i + 2]);
+                    int16_t az = (int16_t)((fifoBuffer[i + 5] << 8) | fifoBuffer[i + 4]);
+                    
+                    ESP_LOGI(TAG, "Frame[%d]: ax=%d, ay=%d, az=%d", i / 6, ax, ay, az);
+                }
+            }
+            
+            // Flush FIFO
+            bmi160_reset_fifo(handle);
+        }
+    }
+    
+    ESP_LOGI(TAG, "Sensor task completed for this wake cycle");
+    
+    // Task must not return in FreeRTOS - delete itself after completing work
+    ESP_LOGI(TAG, "Deleting sensor task...");
+    vTaskDelete(NULL); // Delete current task
+}
+
 // Enable automatic light sleep for power optimization
 static void enable_automatic_light_sleep(void)
 {
@@ -179,7 +236,7 @@ static void disable_automatic_light_sleep(void)
     
     esp_pm_config_t pm_config_no_sleep = {
         .max_freq_mhz = 80,
-        .min_freq_mhz = 80,
+        .min_freq_mhz = 10,
         .light_sleep_enable = false
     };
     
@@ -535,7 +592,7 @@ void app_main(void)
     example_wifi_init();
     example_espnow_init();
 
-    // Initialize sensor only if not already initialized (after light sleep wake up)
+    // Initialize sensor on first boot only
     if (!sensor_initialized) {
         ESP_LOGI(TAG, "Initializing sensor for the first time");
         esp_err_t sensor_ret = sensor_init();
@@ -546,7 +603,15 @@ void app_main(void)
             sensor_initialized = true;
         }
     } else {
-        ESP_LOGI(TAG, "Sensor already initialized, skipping init to save power");
+        ESP_LOGI(TAG, "Woke from light sleep - sensor already initialized");
+        // Create new sensor task for this wake cycle
+        bmi160_handle_t sensor_handle = sensor_get_handle();
+        if (sensor_handle != NULL) {
+            ESP_LOGI(TAG, "Creating new sensor task for this wake cycle");
+            xTaskCreate(example_sensor_task_wrapper, "sensor_poll_wake", 20048, NULL, 4, NULL);
+        } else {
+            ESP_LOGW(TAG, "Sensor handle is NULL, skipping task creation");
+        }
     }
 
     // Enable automatic light sleep for power optimization
