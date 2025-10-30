@@ -95,6 +95,20 @@ bmi160_handle_t sensor_get_handle(void);
  */
 bool sensor_is_initialized(void);
 
+/**
+ * @brief Suspend sensor polling task
+ * 
+ * @return esp_err_t ESP_OK on success
+ */
+esp_err_t sensor_suspend_poll_task(void);
+
+/**
+ * @brief Resume sensor polling task
+ * 
+ * @return esp_err_t ESP_OK on success
+ */
+esp_err_t sensor_resume_poll_task(void);
+
 #ifdef __cplusplus
 }
 #endif

@@ -18,6 +18,7 @@ static const char *TAG = "sensor";
 static sensor_task_ctx_t *s_sensor_ctx = NULL;
 static bmi160_handle_t s_sensor_handle = NULL;
 static bool s_sensor_initialized = false;
+static TaskHandle_t s_sensor_poll_task_handle = NULL;
 
 /**
  * @brief Arduino-style FIFO reading function - Wait for FIFO full
@@ -346,7 +347,7 @@ esp_err_t sensor_init_with_config(const sensor_config_t *config)
                                     20048, 
                                     s_sensor_ctx, 
                                     4, 
-                                    NULL);
+                                    &s_sensor_poll_task_handle);
     if (task_ret != pdPASS) {
         ESP_LOGE(TAG, "Failed to create sensor polling task");
         free(s_sensor_ctx);
@@ -406,4 +407,44 @@ bmi160_handle_t sensor_get_handle(void)
 bool sensor_is_initialized(void)
 {
     return s_sensor_initialized;
+}
+
+/**
+ * @brief Suspend sensor polling task
+ */
+esp_err_t sensor_suspend_poll_task(void)
+{
+    if (!s_sensor_initialized) {
+        ESP_LOGW(TAG, "Sensor not initialized");
+        return ESP_ERR_INVALID_STATE;
+    }
+    
+    if (s_sensor_poll_task_handle != NULL) {
+        vTaskSuspend(s_sensor_poll_task_handle);
+        ESP_LOGI(TAG, "Sensor polling task suspended");
+        return ESP_OK;
+    }
+    
+    ESP_LOGW(TAG, "Sensor polling task handle not found");
+    return ESP_ERR_NOT_FOUND;
+}
+
+/**
+ * @brief Resume sensor polling task
+ */
+esp_err_t sensor_resume_poll_task(void)
+{
+    if (!s_sensor_initialized) {
+        ESP_LOGW(TAG, "Sensor not initialized");
+        return ESP_ERR_INVALID_STATE;
+    }
+    
+    if (s_sensor_poll_task_handle != NULL) {
+        vTaskResume(s_sensor_poll_task_handle);
+        ESP_LOGI(TAG, "Sensor polling task resumed");
+        return ESP_OK;
+    }
+    
+    ESP_LOGW(TAG, "Sensor polling task handle not found");
+    return ESP_ERR_NOT_FOUND;
 }
