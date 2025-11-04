@@ -110,7 +110,7 @@ static void sensor_demo_headerless_fifo(bmi160_handle_t handle)
         ESP_LOGI(TAG, "Parsed %d accelerometer frames from FIFO", fifoCount / BMI160_ACCEL_FRAME_SIZE);
         
         // 7. Flush FIFO after reading to prevent overflow
-        bmi160_reset_fifo(handle);
+        // bmi160_reset_fifo(handle);
         ESP_LOGI(TAG, "FIFO flushed after reading");
         
     } else {
@@ -198,7 +198,7 @@ static void sensor_poll_task(void *pv)
             // Check if FIFO buffer full interrupt is set (bit 13 = 0x2000)
             if (istat & 0x2000) {
                 ESP_LOGW(TAG, "FIFO buffer full, flushing FIFO");
-                bmi160_reset_fifo(ctx->handle);
+                // bmi160_reset_fifo(ctx->handle);
             }
         }
         
