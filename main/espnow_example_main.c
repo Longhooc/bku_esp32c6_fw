@@ -31,6 +31,8 @@
 #include "esp_crc.h"
 #include "espnow_example.h"
 #include "sensor.h"
+#include "battery.h"
+#include "esp_adc/adc_oneshot.h"
 
 // Extern sensor handle
 extern bmi160_handle_t sensor_get_handle(void);
@@ -44,6 +46,13 @@ extern bmi160_handle_t sensor_get_handle(void);
 // Sleep configuration - Use deep sleep for lowest power consumption
 #define SLEEP_DURATION_SECONDS 600
 #define WAKE_DURATION_SECONDS 20
+
+// Battery voltage reading configuration
+// ADC_CHANNEL_0 = GPIO0, ADC_CHANNEL_1 = GPIO1, ADC_CHANNEL_2 = GPIO2, etc.
+#define BATTERY_ADC_CHANNEL ADC_CHANNEL_0  // GPIO0 on ESP32-C6
+// Voltage divider ratio: Set to 1.0 if no divider, or divider ratio if using voltage divider
+// Note: ADC_ATTEN_DB_12 can measure 0-3.9V, so LiFePO4 (max 3.6V) can be measured directly without divider
+#define BATTERY_VOLTAGE_DIVIDER_RATIO 1.0f  // No divider needed for 0-3.9V range
 
 // Sleep variables
 static esp_timer_handle_t sleep_timer = NULL;
@@ -772,6 +781,35 @@ void app_main(void)
     // Setup GPIO8 as output and set to LOW
     setup_gpio8_low();
 
+    // Initialize battery voltage reading module
+    // Using GPIO0 (ADC_CHANNEL_0) for battery voltage reading
+    // ADC_ATTEN_DB_12 can measure 0-3.9V, so LiFePO4 (max 3.6V) can be measured directly
+    ESP_LOGI(TAG, "Initializing battery voltage reading module - GPIO0 (ADC_CHANNEL_0)");
+    ESP_LOGI(TAG, "ADC range: 0-3.9V (ADC_ATTEN_DB_12), Voltage divider ratio: %.3f", 
+             BATTERY_VOLTAGE_DIVIDER_RATIO);
+    esp_err_t battery_ret = battery_voltage_init(BATTERY_ADC_CHANNEL, BATTERY_VOLTAGE_DIVIDER_RATIO);
+    if (battery_ret != ESP_OK)
+    {
+        ESP_LOGE(TAG, "Failed to initialize battery voltage module: %s", esp_err_to_name(battery_ret));
+    }
+    else
+    {
+        ESP_LOGI(TAG, "Battery voltage module initialized successfully");
+        
+        // Read and log battery voltage
+        uint32_t voltage_mv = 0;
+        float voltage_v = 0.0f;
+        if (battery_voltage_read_mv(&voltage_mv) == ESP_OK)
+        {
+            battery_voltage_read_v(&voltage_v);
+            ESP_LOGI(TAG, "Battery voltage: %lu mV (%.3f V)", voltage_mv, voltage_v);
+        }
+        else
+        {
+            ESP_LOGE(TAG, "Failed to read battery voltage");
+        }
+    }
+
     example_wifi_init();
     example_espnow_init();
     // Initialize sensor on first boot only
@@ -827,6 +865,20 @@ void app_main(void)
     ESP_LOGI(TAG, "Entering main loop - system will continue sleep/wake cycles");
     while (1)
     {
+        // Read and log battery voltage periodically (every 10 seconds)
+        static uint32_t battery_read_counter = 0;
+        if (battery_voltage_is_initialized() && (battery_read_counter % 10 == 0))
+        {
+            uint32_t voltage_mv = 0;
+            float voltage_v = 0.0f;
+            if (battery_voltage_read_mv(&voltage_mv) == ESP_OK)
+            {
+                battery_voltage_read_v(&voltage_v);
+                ESP_LOGI(TAG, "Battery voltage: %lu mV (%.3f V)", voltage_mv, voltage_v);
+            }
+        }
+        battery_read_counter++;
+        
         // Let the system handle sleep/wake cycles automatically
         vTaskDelay(pdMS_TO_TICKS(1000)); // Check every second
     }
