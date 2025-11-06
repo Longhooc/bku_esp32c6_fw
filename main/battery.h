@@ -11,6 +11,8 @@
 #include <stdbool.h>
 #include "esp_err.h"
 
+#define OFFSET_VOLTAGE 90
+
 #ifdef __cplusplus
 extern "C" {
 #endif

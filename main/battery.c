@@ -164,7 +164,7 @@ esp_err_t battery_voltage_read_mv(uint32_t *voltage_mv)
     }
 
     // Apply voltage divider ratio
-    *voltage_mv = (uint32_t)(voltage_raw_mv * battery_ctx.voltage_divider_ratio);
+    *voltage_mv = (uint32_t)(voltage_raw_mv * battery_ctx.voltage_divider_ratio + OFFSET_VOLTAGE);
 
     return ESP_OK;
 }
@@ -182,7 +182,7 @@ esp_err_t battery_voltage_read_v(float *voltage_v)
         return ret;
     }
 
-    *voltage_v = (float)voltage_mv / 1000.0f;
+    *voltage_v = (float)voltage_mv / 1000.0f ;
     return ESP_OK;
 }
 

@@ -78,6 +78,7 @@ typedef struct
     int32_t ax_ms2_x100; // Acceleration X in m/s^2 * 100
     int32_t ay_ms2_x100; // Acceleration Y in m/s^2 * 100
     int32_t az_ms2_x100; // Acceleration Z in m/s^2 * 100
+    uint32_t battery_voltage_mv; // Battery voltage in millivolts
 } sensor_data_t;
 
 static void example_espnow_deinit(example_espnow_send_param_t *send_param);
@@ -136,7 +137,10 @@ static void example_wifi_init(void)
     ESP_ERROR_CHECK(esp_wifi_set_channel(CONFIG_ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE));
 
 #if CONFIG_ESPNOW_ENABLE_LONG_RANGE
-    ESP_ERROR_CHECK(esp_wifi_set_protocol(ESPNOW_WIFI_IF, WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N | WIFI_PROTOCOL_LR));
+    // Enable Long Range mode for ESP-NOW
+    // Note: Both sender and receiver must have the same long range configuration
+    ESP_ERROR_CHECK(esp_wifi_set_protocol(ESPNOW_WIFI_IF, WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N));
+    ESP_LOGI(TAG, "Long Range mode enabled for ESP-NOW");
 #endif
 }
 
@@ -312,17 +316,41 @@ static void example_sensor_task_wrapper(void *arg)
                 int32_t ay_ms2_x100 = (int32_t)(ay_mg_x100 * 980665LL / 1000000LL);
                 int32_t az_ms2_x100 = (int32_t)(az_mg_x100 * 980665LL / 1000000LL);
 
-                ESP_LOGI(TAG, "Max frame[%d] m/s^2: ax=%.3f, ay=%.3f, az=%.3f",
+                // Read battery voltage
+                uint32_t battery_voltage_mv = 0;
+                if (battery_voltage_is_initialized())
+                {
+                    if (battery_voltage_read_mv(&battery_voltage_mv) == ESP_OK)
+                    {
+                        float battery_voltage_v = (float)battery_voltage_mv / 1000.0f;
+                        ESP_LOGI(TAG, "Battery voltage: %lu mV (%.3f V)", battery_voltage_mv, battery_voltage_v);
+                    }
+                    else
+                    {
+                        ESP_LOGW(TAG, "Failed to read battery voltage, using 0");
+                        battery_voltage_mv = 0;
+                    }
+                }
+                else
+                {
+                    ESP_LOGW(TAG, "Battery voltage module not initialized, using 0");
+                    battery_voltage_mv = 0;
+                }
+
+                ESP_LOGI(TAG, "Max frame[%d] m/s^2: ax=%.3f, ay=%.3f, az=%.3f, Battery: %lu mV (%.3f V)",
                          max_frame_idx,
                          (float)ax_ms2_x100 / 100.0f,
                          (float)ay_ms2_x100 / 100.0f,
-                         (float)az_ms2_x100 / 100.0f);
+                         (float)az_ms2_x100 / 100.0f,
+                         battery_voltage_mv,
+                         (float)battery_voltage_mv / 1000.0f);
 
                 // Send sensor data via ESPNOW
                 sensor_data_t sensor_data = {
                     .ax_ms2_x100 = ax_ms2_x100,
                     .ay_ms2_x100 = ay_ms2_x100,
-                    .az_ms2_x100 = az_ms2_x100};
+                    .az_ms2_x100 = az_ms2_x100,
+                    .battery_voltage_mv = battery_voltage_mv};
 
                 uint8_t send_buffer[sizeof(example_espnow_data_t) + sizeof(sensor_data_t)];
                 example_espnow_data_t *espnow_data = (example_espnow_data_t *)send_buffer;
@@ -340,6 +368,15 @@ static void example_sensor_task_wrapper(void *arg)
                 if (ret != ESP_OK)
                 {
                     ESP_LOGE(TAG, "Failed to send sensor data via ESPNOW: %s", esp_err_to_name(ret));
+                }
+                else
+                {
+                    ESP_LOGI(TAG, "Sent ESPNOW: accel(%.3f, %.3f, %.3f) m/s^2, battery: %lu mV (%.3f V)",
+                             (float)ax_ms2_x100 / 100.0f,
+                             (float)ay_ms2_x100 / 100.0f,
+                             (float)az_ms2_x100 / 100.0f,
+                             battery_voltage_mv,
+                             (float)battery_voltage_mv / 1000.0f);
                 }
             }
 

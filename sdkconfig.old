@@ -419,7 +419,7 @@ CONFIG_IDF_TOOLCHAIN_GCC=y
 CONFIG_IDF_TARGET_ARCH_RISCV=y
 CONFIG_IDF_TARGET_ARCH="riscv"
 CONFIG_IDF_TARGET="esp32c6"
-CONFIG_IDF_INIT_VERSION="$IDF_INIT_VERSION"
+CONFIG_IDF_INIT_VERSION="5.5.0"
 CONFIG_IDF_TARGET_ESP32C6=y
 CONFIG_IDF_FIRMWARE_CHIP_ID=0x000D
 
@@ -631,7 +631,9 @@ CONFIG_ESPNOW_SEND_COUNT=100
 CONFIG_ESPNOW_SEND_DELAY=1000
 CONFIG_ESPNOW_SEND_LEN=10
 # CONFIG_ESPNOW_ENABLE_LONG_RANGE is not set
-# CONFIG_ESPNOW_ENABLE_POWER_SAVE is not set
+CONFIG_ESPNOW_ENABLE_POWER_SAVE=y
+CONFIG_ESPNOW_WAKE_WINDOW=50
+CONFIG_ESPNOW_WAKE_INTERVAL=100
 # end of Example Configuration
 
 #
@@ -673,6 +675,18 @@ CONFIG_COMPILER_ORPHAN_SECTIONS_WARNING=y
 
 #
 # Component config
+#
+
+#
+# !!! MINIMAL_BUILD is enabled !!!
+#
+
+#
+# Only common components and those transitively required by the main component are listed
+#
+
+#
+# If a component configuration is missing, please add it to the main component's requirements
 #
 
 #
@@ -761,6 +775,14 @@ CONFIG_COMPILER_ORPHAN_SECTIONS_WARNING=y
 # CONFIG_EFUSE_VIRTUAL is not set
 CONFIG_EFUSE_MAX_BLK_LEN=256
 # end of eFuse Bit Manager
+
+#
+# ADC and ADC Calibration
+#
+# CONFIG_ADC_ONESHOT_CTRL_FUNC_IN_IRAM is not set
+# CONFIG_ADC_CONTINUOUS_ISR_IRAM_SAFE is not set
+# CONFIG_ADC_ENABLE_DEBUG_LOG is not set
+# end of ADC and ADC Calibration
 
 #
 # Wireless Coexistence
