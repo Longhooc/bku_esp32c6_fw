@@ -403,10 +403,31 @@ static void example_sensor_task_wrapper(void *arg)
     sleep_device();
 }
 
-// Enable automatic light sleep for power optimization (disabled for deep sleep mode)
+// Enable automatic light sleep for power optimization
 static void enable_automatic_light_sleep(void)
 {
-    ESP_LOGI(TAG, "Automatic light sleep is disabled; using deep sleep instead");
+    ESP_LOGI(TAG, "Enabling automatic light sleep for power optimization");
+    
+    // Configure power management
+    esp_err_t ret = esp_pm_configure(&pm_config);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to configure power management: %s", esp_err_to_name(ret));
+        return;
+    }
+    
+    // Enable automatic light sleep
+    esp_pm_config_t pm_config_light = {
+        .max_freq_mhz = 80,
+        .min_freq_mhz = 10,
+        .light_sleep_enable = true
+    };
+    
+    ret = esp_pm_configure(&pm_config_light);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to enable light sleep: %s", esp_err_to_name(ret));
+    } else {
+        ESP_LOGI(TAG, "Automatic light sleep enabled successfully");
+    }
 }
 
 // Disable automatic light sleep
@@ -849,6 +870,8 @@ void app_main(void)
 
     example_wifi_init();
     example_espnow_init();
+
+    enable_automatic_light_sleep();
     // Initialize sensor on first boot only
     if (!sensor_initialized)
     {
@@ -882,7 +905,7 @@ void app_main(void)
     }
 
     // Enable automatic light sleep for power optimization
-    
+   
 
     // Create timer for sleep cycle - wake for WAKE_DURATION_SECONDS then sleep for SLEEP_DURATION_SECONDS
     ESP_LOGI(TAG, "Starting wake window - will deep sleep in %d seconds", WAKE_DURATION_SECONDS);
