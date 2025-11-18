@@ -307,14 +307,50 @@ static void example_sensor_task_wrapper(void *arg)
                     }
                 }
 
-                // Convert max sample to m/s^2 (fixed-point, *100)
-                int32_t ax_mg_x100 = (int32_t)max_ax * 244 / 1000; // mg * 100
-                int32_t ay_mg_x100 = (int32_t)max_ay * 244 / 1000; // mg * 100
-                int32_t az_mg_x100 = (int32_t)max_az * 244 / 1000; // mg * 100
+                // Read actual accelerometer range from sensor to calculate correct conversion factor
+                // Read register directly (same method as bmi160_enable_anymotion_wakeup_ms2)
+                uint8_t acc_range_reg = 0;
+                int acc_mg_per_lsb_x1000 = 244; // Default to 8G (0.244 mg/LSB)
+                
+                if (bmi160_get_register(handle, BMI160_REG_ACC_RANGE, &acc_range_reg) == ESP_OK) {
+                    // Calculate conversion factor based on actual range
+                    // Per BMI160 datasheet: 2G=0.061, 4G=0.122, 8G=0.244, 16G=0.488 mg/LSB
+                    // Mask with 0x0F to get only range bits (same as bmi160_acc_lsb_mg_for_range)
+                    switch (acc_range_reg & 0x0F) {
+                        case BMI160_ACC_RANGE_2G:
+                            acc_mg_per_lsb_x1000 = 61;   // 0.061 mg/LSB
+                            break;
+                        case BMI160_ACC_RANGE_4G:
+                            acc_mg_per_lsb_x1000 = 122;  // 0.122 mg/LSB
+                            break;
+                        case BMI160_ACC_RANGE_8G:
+                            acc_mg_per_lsb_x1000 = 244;  // 0.244 mg/LSB
+                            break;
+                        case BMI160_ACC_RANGE_16G:
+                            acc_mg_per_lsb_x1000 = 488;  // 0.488 mg/LSB
+                            break;
+                        default:
+                            ESP_LOGW(TAG, "Unknown acc range register 0x%02X, using default 8G", acc_range_reg);
+                            acc_mg_per_lsb_x1000 = 244;
+                            break;
+                    }
+                    ESP_LOGD(TAG, "Accelerometer range register: 0x%02X, conversion factor: %d (mg/LSB * 1000)", 
+                             acc_range_reg, acc_mg_per_lsb_x1000);
+                } else {
+                    ESP_LOGW(TAG, "Failed to read accelerometer range register, using default 8G conversion");
+                }
 
-                int32_t ax_ms2_x100 = (int32_t)(ax_mg_x100 * 980665LL / 1000000LL);
-                int32_t ay_ms2_x100 = (int32_t)(ay_mg_x100 * 980665LL / 1000000LL);
-                int32_t az_ms2_x100 = (int32_t)(az_mg_x100 * 980665LL / 1000000LL);
+                // Convert max sample to m/s^2 (fixed-point, *100)
+                // Convert raw LSB to mg * 100: (raw * mg_per_lsb_x1000) / 1000 = mg, then * 100 = mg * 100
+                int32_t ax_mg_x100 = ((int32_t)max_ax * (int32_t)acc_mg_per_lsb_x1000 + (max_ax >= 0 ? 500 : -500)) / 1000;
+                int32_t ay_mg_x100 = ((int32_t)max_ay * (int32_t)acc_mg_per_lsb_x1000 + (max_ay >= 0 ? 500 : -500)) / 1000;
+                int32_t az_mg_x100 = ((int32_t)max_az * (int32_t)acc_mg_per_lsb_x1000 + (max_az >= 0 ? 500 : -500)) / 1000;
+
+                // Convert mg to m/s^2: 1 mg = 9.80665e-3 m/s^2
+                // mg * 100 -> m/s^2 * 100: (mg_x100 * 980665) / 1000000
+                int32_t ax_ms2_x100 = (int32_t)((int64_t)ax_mg_x100 * 980665LL + (ax_mg_x100 >= 0 ? 500000 : -500000)) / 1000000LL;
+                int32_t ay_ms2_x100 = (int32_t)((int64_t)ay_mg_x100 * 980665LL + (ay_mg_x100 >= 0 ? 500000 : -500000)) / 1000000LL;
+                int32_t az_ms2_x100 = (int32_t)((int64_t)az_mg_x100 * 980665LL + (az_mg_x100 >= 0 ? 500000 : -500000)) / 1000000LL;
 
                 // Read battery voltage
                 uint32_t battery_voltage_mv = 0;
