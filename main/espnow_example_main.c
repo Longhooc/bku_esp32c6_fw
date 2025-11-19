@@ -837,6 +837,22 @@ static void example_espnow_deinit(example_espnow_send_param_t *send_param)
     s_example_espnow_queue = NULL;
     esp_now_deinit();
 }
+static void configure_io4_wakeup(void) {
+    gpio_config_t io_conf = {
+        .pin_bit_mask = 1ULL << GPIO_NUM_4,
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLDOWN_ENABLE,
+        .pull_down_en = GPIO_PULLUP_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&io_conf);
+
+    esp_err_t err = esp_sleep_enable_ext1_wakeup(1ULL << GPIO_NUM_4, ESP_EXT1_WAKEUP_ANY_HIGH);
+    
+    if (err != ESP_OK) {
+        printf("Lỗi cấu hình wakeup: %s\n", esp_err_to_name(err));
+    }
+}
 
 void app_main(void)
 {
@@ -847,7 +863,14 @@ void app_main(void)
         ESP_LOGE(TAG, "Failed to create sensor mutex");
         return;
     }
+    //io4 interup
+    configure_io4_wakeup();
+    // Cách thay thế gọn hơn trên C6/S3
+// esp_deep_sleep_enable_gpio_wakeup(1ULL << GPIO_NUM_4, ESP_GPIO_WAKEUP_GPIO_HIGH);
 
+    if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT1) {
+        ESP_LOGI(TAG, "Wake by IO4 falling edge");
+    }
     // Check if we woke up from light sleep
     esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
 

@@ -53,8 +53,8 @@ typedef struct {
     .clock_speed_hz = 5 * 1000 * 1000, \
     .acc_range = BMI160_ACC_RANGE_8G, \
     .gyr_range = BMI160_GYR_RANGE_500_DPS, \
-    .anymotion_threshold_ms2_x100 = 600, /* 6.00 m/s^2 */ \
-    .anymotion_duration = 8, \
+    .anymotion_threshold_ms2_x100 = 100, /* 6.00 m/s^2 */ \
+    .anymotion_duration = 1, \
     .poll_interval_ms = 200 \
 }
 
