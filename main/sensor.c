@@ -364,6 +364,82 @@ esp_err_t sensor_init_with_config(const sensor_config_t *config)
 }
 
 /**
+ * @brief Resume sensor from deep sleep without resetting it
+ */
+esp_err_t sensor_resume(void)
+{
+    if (s_sensor_initialized) {
+        ESP_LOGW(TAG, "Sensor already initialized");
+        return ESP_OK;
+    }
+    
+    ESP_LOGI(TAG, "Resuming sensor from deep sleep...");
+    
+    // Use default config for pin definitions
+    sensor_config_t config = SENSOR_DEFAULT_CONFIG();
+    
+    // Create BMI160 SPI bus configuration
+    bmi160_spi_bus_config_t bmi_bus = {
+        .gpio_cs = config.gpio_cs,
+        .gpio_mosi = config.gpio_mosi,
+        .gpio_miso = config.gpio_miso,
+        .gpio_sck = config.gpio_sck,
+        .gpio_int1 = config.gpio_int1,
+        .gpio_int2 = config.gpio_int2,
+        .spi_host = config.spi_host,
+        .clock_speed_hz = config.clock_speed_hz,
+    };
+    
+    // Create BMI160 handle
+    // This re-initializes the SPI bus but does NOT send any commands to the sensor
+    esp_err_t ret = bmi160_create(&bmi_bus, &s_sensor_handle);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to create BMI160 handle: %s", esp_err_to_name(ret));
+        return ret;
+    }
+    
+    // Allocate task context
+    s_sensor_ctx = (sensor_task_ctx_t *)malloc(sizeof(sensor_task_ctx_t));
+    if (s_sensor_ctx == NULL) {
+        ESP_LOGE(TAG, "Failed to allocate memory for sensor task context");
+        bmi160_destroy(s_sensor_handle);
+        s_sensor_handle = NULL;
+        return ESP_ERR_NO_MEM;
+    }
+    
+    // Initialize task context
+    s_sensor_ctx->handle = s_sensor_handle;
+    s_sensor_ctx->poll_interval_ms = config.poll_interval_ms;
+    
+    // Set unit conversion scales based on configured ranges
+    // NOTE: We assume the sensor retained its configuration (8G, 500DPS)
+    // If you changed the range in sensor_init, you must match it here
+    s_sensor_ctx->acc_mg_per_lsb_x1000 = 244;  // Default to 8G
+    s_sensor_ctx->gyr_lsb_per_dps_x1000 = 65536; // Default to 500 DPS
+    
+    // Create sensor polling task
+    BaseType_t task_ret = xTaskCreate(sensor_poll_task, 
+                                    "sensor_poll", 
+                                    20048, 
+                                    s_sensor_ctx, 
+                                    4, 
+                                    &s_sensor_poll_task_handle);
+    if (task_ret != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create sensor polling task");
+        free(s_sensor_ctx);
+        s_sensor_ctx = NULL;
+        bmi160_destroy(s_sensor_handle);
+        s_sensor_handle = NULL;
+        return ESP_FAIL;
+    }
+    
+    s_sensor_initialized = true;
+    ESP_LOGI(TAG, "Sensor resumed successfully (no reset performed)");
+    
+    return ESP_OK;
+}
+
+/**
  * @brief Deinitialize sensor module
  */
 esp_err_t sensor_deinit(void)

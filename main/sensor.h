@@ -113,4 +113,12 @@ esp_err_t sensor_resume_poll_task(void);
 }
 #endif
 
+/**
+ * @brief Resume sensor from deep sleep without resetting it
+ * 
+ * This function re-initializes the SPI bus and handle but assumes
+ * the sensor is already configured and running.
+ */
+esp_err_t sensor_resume(void);
+
 #endif // SENSOR_H

@@ -57,7 +57,7 @@ extern bmi160_handle_t sensor_get_handle(void);
 // Sleep variables
 static esp_timer_handle_t sleep_timer = NULL;
 static bool is_sleep_mode = false;
-static bool sensor_initialized = false;         // Track sensor initialization state
+RTC_DATA_ATTR static bool sensor_initialized = false;         // Track sensor initialization state (persists in deep sleep)
 static SemaphoreHandle_t s_sensor_mutex = NULL; // Mutex to protect sensor access
 static bool s_sensor_task_running = false;      // Track if sensor task is running
 static esp_pm_config_t pm_config = {
@@ -169,6 +169,10 @@ static void sleep_device(void)
 
     // Configure wake up sources for deep sleep
     esp_sleep_enable_timer_wakeup(SLEEP_DURATION_SECONDS * 1000000ULL);
+
+    // Enable GPIO hold for IO4 to maintain its state (Input, Pull-down) during deep sleep
+    // This prevents the pin from floating or changing state which could cause missed interrupts
+    gpio_hold_en(GPIO_NUM_4);
 
     ESP_LOGI(TAG, "Deep sleep configured - wake up in %d seconds", SLEEP_DURATION_SECONDS);
 
@@ -856,6 +860,10 @@ static void configure_io4_wakeup(void) {
 
 void app_main(void)
 {
+    // Disable GPIO hold for IO4 if it was enabled during deep sleep
+    // This allows reconfiguring the pin if needed
+    gpio_hold_dis(GPIO_NUM_4);
+
     // Create sensor mutex
     s_sensor_mutex = xSemaphoreCreateMutex();
     if (s_sensor_mutex == NULL)
@@ -874,9 +882,10 @@ void app_main(void)
     // Check if we woke up from light sleep
     esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
 
-    if (wakeup_reason == ESP_SLEEP_WAKEUP_TIMER)
+    if (wakeup_reason == ESP_SLEEP_WAKEUP_TIMER || wakeup_reason == ESP_SLEEP_WAKEUP_EXT1)
     {
-    ESP_LOGI(TAG, "Woke up from deep sleep by timer");
+        ESP_LOGI(TAG, "Woke up from deep sleep (Reason: %s)", 
+                 wakeup_reason == ESP_SLEEP_WAKEUP_TIMER ? "Timer" : "IO4/EXT1");
         is_sleep_mode = false;
     }
     else
@@ -931,7 +940,7 @@ void app_main(void)
     example_espnow_init();
 
     enable_automatic_light_sleep();
-    // Initialize sensor on first boot only
+    // Initialize sensor
     if (!sensor_initialized)
     {
         ESP_LOGI(TAG, "Initializing sensor for the first time");
@@ -959,8 +968,26 @@ void app_main(void)
     else
     {
         ESP_LOGI(TAG, "Woke from deep sleep - sensor already initialized");
-        // Do not create task here - sleep_device() will create it after wake up
-        // This prevents duplicate task creation
+        
+        // Resume sensor (re-init SPI bus without resetting sensor)
+        esp_err_t sensor_ret = sensor_resume();
+        if (sensor_ret != ESP_OK)
+        {
+            ESP_LOGE(TAG, "Failed to resume sensor: %s", esp_err_to_name(sensor_ret));
+            // If resume fails, try full init
+            sensor_initialized = false;
+            sensor_init();
+        }
+        else
+        {
+            ESP_LOGI(TAG, "Sensor resumed successfully");
+            
+            // Suspend polling task as usual
+            sensor_suspend_poll_task();
+            
+            // Run the wrapper task to read FIFO
+            example_sensor_task_wrapper(NULL);
+        }
     }
 
     // Enable automatic light sleep for power optimization
