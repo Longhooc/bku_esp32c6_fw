@@ -269,8 +269,8 @@ esp_err_t sensor_init_with_config(const sensor_config_t *config)
     }
     
     // Enable any-motion wakeup
-    ret = bmi160_enable_anymotion_wakeup_ms2(s_sensor_handle, 
-                                           config->anymotion_threshold_ms2_x100, 
+    ret = bmi160_enable_anymotion_wakeup_mg(s_sensor_handle, 
+                                           config->anymotion_threshold_mg, 
                                            config->anymotion_duration);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to enable any-motion wakeup: %s", esp_err_to_name(ret));
@@ -396,6 +396,16 @@ esp_err_t sensor_resume(void)
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to create BMI160 handle: %s", esp_err_to_name(ret));
         return ret;
+    }
+    
+    // IMPORTANT: Re-configure any-motion wakeup on resume to ensure correct threshold
+    // The BMI160 may have retained old configuration or been affected by deep sleep
+    ret = bmi160_enable_anymotion_wakeup_mg(s_sensor_handle, 
+                                           config.anymotion_threshold_mg, 
+                                           config.anymotion_duration);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to re-configure any-motion on resume: %s", esp_err_to_name(ret));
+        // Continue anyway - don't fail resume
     }
     
     // Allocate task context

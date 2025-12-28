@@ -36,7 +36,7 @@ typedef struct {
     int clock_speed_hz;    // SPI clock
     int acc_range;         // Accelerometer range (BMI160_ACC_RANGE_*)
     int gyr_range;         // Gyroscope range (BMI160_GYR_RANGE_*)
-    int anymotion_threshold_ms2_x100;  // Any-motion threshold in m/s^2 * 100
+    int anymotion_threshold_mg;        // Any-motion threshold in mg
     int anymotion_duration;            // Any-motion duration in samples
     int poll_interval_ms;  // Polling interval in milliseconds
 } sensor_config_t;
@@ -51,10 +51,10 @@ typedef struct {
     .gpio_int2 = 18, \
     .spi_host = SPI2_HOST, \
     .clock_speed_hz = 5 * 1000 * 1000, \
-    .acc_range = BMI160_ACC_RANGE_8G, \
+    .acc_range = BMI160_ACC_RANGE_16G, \
     .gyr_range = BMI160_GYR_RANGE_500_DPS, \
-    .anymotion_threshold_ms2_x100 = 100, /* 6.00 m/s^2 */ \
-    .anymotion_duration = 1, \
+    .anymotion_threshold_mg = 7960, /* Max threshold for 16G range (255 LSB * 31.25mg = 7968mg ~ 8g) */ \
+    .anymotion_duration = 3, /* Valid: 0-3 only (2 bits). Duration = anymotion_duration + 1 samples */ \
     .poll_interval_ms = 200 \
 }
 

@@ -344,8 +344,8 @@ esp_err_t bmi160_create(const bmi160_spi_bus_config_t *bus_cfg, bmi160_handle_t 
 esp_err_t bmi160_init_default(bmi160_handle_t handle);
 esp_err_t bmi160_config_ranges(bmi160_handle_t handle, bmi160_acc_range_t acc, bmi160_gyr_range_t gyr);
 esp_err_t bmi160_enable_anymotion_wakeup(bmi160_handle_t handle, uint8_t threshold, uint8_t duration);
-// Configure any-motion threshold by physical unit. ms2_x100 is m/s^2 * 100 (e.g. 5.00 m/s^2 -> 500)
-esp_err_t bmi160_enable_anymotion_wakeup_ms2(bmi160_handle_t handle, int ms2_x100, uint8_t duration);
+// Configure any-motion threshold by physical unit (mg).
+esp_err_t bmi160_enable_anymotion_wakeup_mg(bmi160_handle_t handle, int mg, uint8_t duration);
 esp_err_t bmi160_read_sample(bmi160_handle_t handle, bmi160_sample_t *out);
 esp_err_t bmi160_read_int_status(bmi160_handle_t handle, uint32_t *out_status);
 esp_err_t bmi160_read_status(bmi160_handle_t handle, uint8_t *out_status);

@@ -141,13 +141,15 @@ esp_err_t bmi160_create(const bmi160_spi_bus_config_t *bus_cfg, bmi160_handle_t 
     err = spi_bus_add_device(bus_cfg->spi_host, &devcfg, &handle->spi);
     if (err != ESP_OK) { free(handle); return err; }
 
-    // Configure INT pins
+    // Configure INT pins as input without pull-up/pull-down
+    // BMI160 INT1/INT2 are configured as push-pull outputs in bmi160_init_default()
+    // No need for pull resistors - they can cause false triggers during power transitions
     if (handle->gpio_int1 >= 0) {
-        gpio_config_t io = { .pin_bit_mask = 1ULL << handle->gpio_int1, .mode = GPIO_MODE_INPUT, .pull_up_en = 1, .pull_down_en = 0, .intr_type = GPIO_INTR_ANYEDGE };
+        gpio_config_t io = { .pin_bit_mask = 1ULL << handle->gpio_int1, .mode = GPIO_MODE_INPUT, .pull_up_en = 0, .pull_down_en = 0, .intr_type = GPIO_INTR_DISABLE };
         gpio_config(&io);
     }
     if (handle->gpio_int2 >= 0) {
-        gpio_config_t io = { .pin_bit_mask = 1ULL << handle->gpio_int2, .mode = GPIO_MODE_INPUT, .pull_up_en = 1, .pull_down_en = 0, .intr_type = GPIO_INTR_ANYEDGE };
+        gpio_config_t io = { .pin_bit_mask = 1ULL << handle->gpio_int2, .mode = GPIO_MODE_INPUT, .pull_up_en = 0, .pull_down_en = 0, .intr_type = GPIO_INTR_DISABLE };
         gpio_config(&io);
     }
 
@@ -198,11 +200,10 @@ esp_err_t bmi160_init_default(bmi160_handle_t handle)
     ESP_RETURN_ON_ERROR(bmi160_spi_write(handle, BMI160_REG_GYR_RANGE, &gyr_range, 1), TAG_BMI160, "gyr range");
 
     // INT output push-pull, active high on INT1 and INT2
-    uint8_t int_out = 0;
-    int_out |= (1 << 0); // INT1 push-pull
-    int_out |= (1 << 1); // INT1 active high
-    int_out |= (1 << 2); // INT2 push-pull
-    int_out |= (1 << 3); // INT2 active high
+    // INT1: Enable(bit3)=1, OD(bit2)=0, Lvl(bit1)=1, Edge(bit0)=0 (Level latched) -> 0x0A
+    // INT2: Enable(bit7)=1, OD(bit6)=0, Lvl(bit5)=1, Edge(bit4)=0 (Level latched) -> 0xA0
+    // Total: 0xAA
+    uint8_t int_out = 0xAA; 
     ESP_RETURN_ON_ERROR(bmi160_spi_write(handle, BMI160_REG_INT_OUT_CTRL, &int_out, 1), TAG_BMI160, "int out");
 
     // Latch duration 80ms
@@ -214,8 +215,10 @@ esp_err_t bmi160_init_default(bmi160_handle_t handle)
     ESP_RETURN_ON_ERROR(bmi160_set_gyro_fifo_enabled(handle, false), TAG_BMI160, "gyro fifo enable");
     ESP_RETURN_ON_ERROR(bmi160_set_fifo_header_mode_enabled(handle, false), TAG_BMI160, "fifo header enable");
     
-    // Enable FIFO buffer full interrupt (optional)
-    ESP_RETURN_ON_ERROR(bmi160_set_int_fifo_buffer_full_enabled(handle, true), TAG_BMI160, "fifo full int enable");
+    // FIFO buffer full interrupt disabled to prevent false wakeups during deep sleep
+    // The BMI160 continues running during ESP32 deep sleep, FIFO fills up, and 
+    // when full it triggers INT1 → wakes up ESP32 regardless of any-motion threshold
+    // ESP_RETURN_ON_ERROR(bmi160_set_int_fifo_buffer_full_enabled(handle, true), TAG_BMI160, "fifo full int enable");
 
     return ESP_OK;
 }
@@ -233,20 +236,62 @@ esp_err_t bmi160_config_ranges(bmi160_handle_t handle, bmi160_acc_range_t acc, b
 esp_err_t bmi160_enable_anymotion_wakeup(bmi160_handle_t handle, uint8_t threshold, uint8_t duration)
 {
     if (!handle) return ESP_ERR_INVALID_ARG;
-    // Configure any-motion on all axes
-    // INT_MOTION_0: any-motion (slope) threshold LSB = 7.81mg at 2G range. We just pass raw.
+    
+    // 1. Configure Any-Motion Threshold & Duration
+    // INT_MOTION_0: any-motion (slope) threshold
     ESP_RETURN_ON_ERROR(bmi160_spi_write(handle, BMI160_REG_INT_MOTION_0, &threshold, 1), TAG_BMI160, "mot0");
-    // INT_MOTION_1: duration
+    // INT_MOTION_1: duration (bits 1:0)
+    // We should preserve reserved bits if strict, but usually just writing duration (0-3) is fine here.
     ESP_RETURN_ON_ERROR(bmi160_spi_write(handle, BMI160_REG_INT_MOTION_1, &duration, 1), TAG_BMI160, "mot1");
-    // INT_MOTION_2: enable axes XYZ
-    uint8_t mot2 = 0x07; // x,y,z enable
+    
+    // DEBUG: Read back registers to verify they were written correctly
+    uint8_t readback_thr = 0, readback_dur = 0;
+    bmi160_spi_read(handle, BMI160_REG_INT_MOTION_0, &readback_thr, 1);
+    bmi160_spi_read(handle, BMI160_REG_INT_MOTION_1, &readback_dur, 1);
+    ESP_LOGI(TAG_BMI160, "Any-motion verify: Written threshold=%u, readback=%u | Written duration=%u, readback=%u",
+             threshold, readback_thr, duration, readback_dur);
+    if (readback_thr != threshold) {
+        ESP_LOGE(TAG_BMI160, "ERROR: Threshold write failed! Expected %u, got %u", threshold, readback_thr);
+    }
+    
+    // INT_MOTION_2: enable axes XYZ (bits 0,1,2) - RMW not strictly needed if we want all axes, but good practice
+    uint8_t mot2 = 0;
+    ESP_RETURN_ON_ERROR(bmi160_spi_read(handle, BMI160_REG_INT_MOTION_2, &mot2, 1), TAG_BMI160, "rd mot2");
+    mot2 |= 0x07; // Enable X, Y, Z
     ESP_RETURN_ON_ERROR(bmi160_spi_write(handle, BMI160_REG_INT_MOTION_2, &mot2, 1), TAG_BMI160, "mot2");
-    // INT enable: INT_EN_0 bit 0..2 for any-motion xyz
-    uint8_t en0 = 0x07;
+
+    // 2. Enable Any-Motion Interrupt (INT_EN_0)
+    // Read-Modify-Write to preserve other interrupts (Flat, Orient, Tap, etc.)
+    uint8_t en0 = 0;
+    ESP_RETURN_ON_ERROR(bmi160_spi_read(handle, BMI160_REG_INT_EN_0, &en0, 1), TAG_BMI160, "rd en0");
+    
+    // DEBUG: Log all interrupt enable bits before modifying
+    ESP_LOGI(TAG_BMI160, "INT_EN_0 before: 0x%02X", en0);
+    
+    en0 &= ~0x07; // Clear old Any-Motion X,Y,Z bits
+    en0 |= 0x07;  // Enable Any-Motion X,Y,Z
     ESP_RETURN_ON_ERROR(bmi160_spi_write(handle, BMI160_REG_INT_EN_0, &en0, 1), TAG_BMI160, "en0");
-    // Map any-motion to INT1
-    uint8_t map0 = 0x07; // map any-motion xyz to INT1
+    
+    // DEBUG: Log INT_EN_1 and INT_EN_2 to see what other interrupts are enabled
+    uint8_t en1 = 0, en2 = 0;
+    bmi160_spi_read(handle, BMI160_REG_INT_EN_1, &en1, 1);
+    bmi160_spi_read(handle, BMI160_REG_INT_EN_2, &en2, 1);
+    ESP_LOGI(TAG_BMI160, "INT_EN registers: EN0=0x%02X EN1=0x%02X EN2=0x%02X", en0, en1, en2);
+    
+    // DEBUG: Log INT_MAP registers to see what's mapped to INT1
+    uint8_t map0 = 0, map1 = 0, map2 = 0;
+    bmi160_spi_read(handle, BMI160_REG_INT_MAP_0, &map0, 1);
+    bmi160_spi_read(handle, BMI160_REG_INT_MAP_1, &map1, 1);
+    bmi160_spi_read(handle, BMI160_REG_INT_MAP_2, &map2, 1);
+    ESP_LOGI(TAG_BMI160, "INT_MAP before: MAP0=0x%02X MAP1=0x%02X MAP2=0x%02X", map0, map1, map2);
+
+    // 3. Map Any-Motion to INT1 (INT_MAP_0)
+    // Read-Modify-Write to preserve other mappings (map0 already declared above)
+    ESP_RETURN_ON_ERROR(bmi160_spi_read(handle, BMI160_REG_INT_MAP_0, &map0, 1), TAG_BMI160, "rd map0");
+    map0 &= ~0x07; // Clear old Any-Motion mapping on INT1
+    map0 |= 0x07;  // Map Any-Motion X,Y,Z to INT1
     ESP_RETURN_ON_ERROR(bmi160_spi_write(handle, BMI160_REG_INT_MAP_0, &map0, 1), TAG_BMI160, "map0");
+
     return ESP_OK;
 }
 
@@ -264,26 +309,47 @@ static inline int bmi160_acc_lsb_mg_for_range(uint8_t acc_range_reg)
     }
 }
 
-esp_err_t bmi160_enable_anymotion_wakeup_ms2(bmi160_handle_t handle, int ms2_x100, uint8_t duration)
+static inline int bmi160_anymotion_threshold_mg_lsb_for_range(uint8_t acc_range_reg)
+{
+    // Per BMI160 datasheet (Register 0x5F INT_MOTION_0):
+    // 1 LSB = 3.91 mg (2g range)
+    // Scaling: 2g=3.91, 4g=7.81, 8g=15.63, 16g=31.25 (mg)
+    // We return values * 100 for precision (e.g. 391 for 3.91mg)
+    switch (acc_range_reg & 0x0F) {
+        case BMI160_ACC_RANGE_2G:   return 391;  // 3.91 mg
+        case BMI160_ACC_RANGE_4G:   return 781;  // 7.81 mg
+        case BMI160_ACC_RANGE_8G:   return 1563; // 15.63 mg
+        case BMI160_ACC_RANGE_16G:  return 3125; // 31.25 mg
+        default: return 781;
+    }
+}
+
+esp_err_t bmi160_enable_anymotion_wakeup_mg(bmi160_handle_t handle, int target_mg, uint8_t duration)
 {
     if (!handle) return ESP_ERR_INVALID_ARG;
     // Read current ACC_RANGE to compute LSB
     uint8_t acc_range = 0;
     ESP_RETURN_ON_ERROR(bmi160_spi_read(handle, BMI160_REG_ACC_RANGE, &acc_range, 1), TAG_BMI160, "rd acc_range");
-    int lsb_mg = bmi160_acc_lsb_mg_for_range(acc_range); // mg per LSB in thousandths
-    // Convert m/s^2*100 to mg: 1g = 9.80665 m/s^2 = 980.665 cm/s^2 = 9806.65 mg
-    // ms2_x100 (m/s^2 * 100) -> mg = ms2_x100 * 1000 / 9.80665 ≈ (ms2_x100 * 1000) / 9.807
-    // Use integer math: mg ≈ (ms2_x100 * 1000 + 5) / 10 (approx 9.81) -> actually that's 100x off. Better:
-    // mg ≈ (ms2_x100 * 1000) / 981 -> since ms2_x100 already *100, true formula: mg = (ms2_x100 * 1000) / 981
-    int mg = (ms2_x100 * 1000 + 490) / 981;
-    // Now convert mg to LSB based on range
-    // lsb_mg is mg per LSB in thousandths (e.g., 122 -> 0.122 mg/LSB). Our mg is in mg.
-    // LSB = mg / (lsb_mg/1000) = mg * 1000 / lsb_mg
-    int lsb = (mg * 1000 + (lsb_mg/2)) / lsb_mg;
+    
+    // Get threshold resolution (mg * 100 per LSB)
+    int mg_x100_per_lsb = bmi160_anymotion_threshold_mg_lsb_for_range(acc_range);
+    
+    // Calculate LSB: target_mg * 100 / mg_x100_per_lsb
+    int lsb = (target_mg * 100 + (mg_x100_per_lsb/2)) / mg_x100_per_lsb;
+    
     if (lsb < 1) lsb = 1;
-    if (lsb > 255) lsb = 255;
+    if (lsb > 255) {
+        ESP_LOGW(TAG_BMI160, "Threshold %d mg exceeds max range capacity (%d mg). Clamped to 255.", 
+                 target_mg, (255 * mg_x100_per_lsb) / 100);
+        lsb = 255;
+    }
+    
     uint8_t thr = (uint8_t)lsb;
-    ESP_LOGI(TAG_BMI160, "any-motion threshold ~%d mg (LSB=%u) at range reg 0x%02X", mg, thr, acc_range);
+    int actual_mg = (lsb * mg_x100_per_lsb) / 100;
+    
+    ESP_LOGI(TAG_BMI160, "Any-motion config: Target=%d mg, Actual=%d mg (LSB=%u), RangeReg=0x%02X", 
+             target_mg, actual_mg, thr, acc_range);
+             
     return bmi160_enable_anymotion_wakeup(handle, thr, duration);
 }
 
@@ -1139,8 +1205,8 @@ esp_err_t bmi160_init_headerless_mode(bmi160_handle_t handle, bool enable_accel,
         ESP_RETURN_ON_ERROR(bmi160_set_gyro_fifo_enabled(handle, false), TAG_BMI160, "disable gyro fifo");
     }
     
-    // Enable FIFO buffer full interrupt (optional)
-    ESP_RETURN_ON_ERROR(bmi160_set_int_fifo_buffer_full_enabled(handle, true), TAG_BMI160, "enable fifo full interrupt");
+    // FIFO buffer full interrupt DISABLED - causes false wakeups during deep sleep
+    // ESP_RETURN_ON_ERROR(bmi160_set_int_fifo_buffer_full_enabled(handle, true), TAG_BMI160, "enable fifo full interrupt");
     
     // Flush FIFO to start fresh
     ESP_RETURN_ON_ERROR(bmi160_reset_fifo(handle), TAG_BMI160, "flush fifo");

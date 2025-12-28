@@ -170,11 +170,37 @@ static void sleep_device(void)
     // Configure wake up sources for deep sleep
     esp_sleep_enable_timer_wakeup(SLEEP_DURATION_SECONDS * 1000000ULL);
 
+    // IMPORTANT: Clear any pending BMI160 interrupts before entering deep sleep
+    // If INT1 is still HIGH due to latched interrupt, it will immediately trigger wake
+    bmi160_handle_t handle = sensor_get_handle();
+    if (handle != NULL) {
+        uint32_t int_status = 0;
+        // Reading interrupt status clears the latched interrupt
+        bmi160_read_int_status(handle, &int_status);
+        if (int_status != 0) {
+            ESP_LOGW(TAG, "Cleared pending interrupt before sleep: 0x%08lx", (unsigned long)int_status);
+        }
+        
+        // Also check if GPIO4 (INT1) is still high after clearing
+        int gpio4_level = gpio_get_level(GPIO_NUM_4);
+        if (gpio4_level == 1) {
+            ESP_LOGW(TAG, "WARNING: GPIO4 (INT1) still HIGH after clearing interrupt!");
+            // Read again to ensure it's cleared
+            bmi160_read_int_status(handle, &int_status);
+        }
+    }
+
     // Enable GPIO hold for IO4 to maintain its state (Input, Pull-down) during deep sleep
     // This prevents the pin from floating or changing state which could cause missed interrupts
     gpio_hold_en(GPIO_NUM_4);
 
-    ESP_LOGI(TAG, "Deep sleep configured - wake up in %d seconds", SLEEP_DURATION_SECONDS);
+    // Final check: log GPIO4 level before sleep
+    int final_gpio4_level = gpio_get_level(GPIO_NUM_4);
+    ESP_LOGI(TAG, "Deep sleep configured - wake up in %d seconds, GPIO4 level before sleep: %d", 
+             SLEEP_DURATION_SECONDS, final_gpio4_level);
+    if (final_gpio4_level == 1) {
+        ESP_LOGE(TAG, "ERROR: GPIO4 is HIGH before sleep - will immediately wake!");
+    }
 
     // Enter deep sleep (lowest power; execution restarts on wake)
     esp_deep_sleep_start();
@@ -312,7 +338,7 @@ static void example_sensor_task_wrapper(void *arg)
                 }
 
                 // Read actual accelerometer range from sensor to calculate correct conversion factor
-                // Read register directly (same method as bmi160_enable_anymotion_wakeup_ms2)
+                // Read register directly (same method as bmi160_enable_anymotion_wakeup_mg)
                 uint8_t acc_range_reg = 0;
                 int acc_mg_per_lsb_x1000 = 244; // Default to 8G (0.244 mg/LSB)
                 
@@ -842,15 +868,12 @@ static void example_espnow_deinit(example_espnow_send_param_t *send_param)
     esp_now_deinit();
 }
 static void configure_io4_wakeup(void) {
-    gpio_config_t io_conf = {
-        .pin_bit_mask = 1ULL << GPIO_NUM_4,
-        .mode = GPIO_MODE_INPUT,
-        .pull_up_en = GPIO_PULLUP_DISABLE,
-        .pull_down_en = GPIO_PULLDOWN_ENABLE,
-        .intr_type = GPIO_INTR_DISABLE,
-    };
-    gpio_config(&io_conf);
-
+    // NOTE: GPIO4 is already configured in bmi160_create() with pull-up
+    // BMI160 INT1 output is configured as active-HIGH, push-pull in bmi160_init_default()
+    // We should NOT reconfigure GPIO4 here to avoid conflicts
+    // Only configure the wakeup source
+    
+    // Use ESP_EXT1_WAKEUP_ANY_HIGH because BMI160 INT1 is active-high
     esp_err_t err = esp_sleep_enable_ext1_wakeup(1ULL << GPIO_NUM_4, ESP_EXT1_WAKEUP_ANY_HIGH);
     
     if (err != ESP_OK) {
@@ -877,7 +900,9 @@ void app_main(void)
 // esp_deep_sleep_enable_gpio_wakeup(1ULL << GPIO_NUM_4, ESP_GPIO_WAKEUP_GPIO_HIGH);
 
     if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT1) {
-        ESP_LOGI(TAG, "Wake by IO4 falling edge");
+        // Log current GPIO4 level to understand the wakeup condition
+        int gpio4_level = gpio_get_level(GPIO_NUM_4);
+        ESP_LOGI(TAG, "Woke from EXT1 (GPIO4), current GPIO4 level: %d", gpio4_level);
     }
     // Check if we woke up from light sleep
     esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
