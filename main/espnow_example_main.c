@@ -33,6 +33,8 @@
 #include "sensor.h"
 #include "battery.h"
 #include "esp_adc/adc_oneshot.h"
+#include "esp_dsp.h"
+#include <math.h>
 
 // Extern sensor handle
 extern bmi160_handle_t sensor_get_handle(void);
@@ -91,6 +93,45 @@ static void disable_automatic_light_sleep(void);
 static esp_err_t create_sleep_timer(void);
 static void example_sensor_task_wrapper(void *arg);
 static void setup_gpio8_low(void);
+
+/* ============================================================================
+ * FFT Collection and Processing
+ * ============================================================================ */
+
+// FFT state variables
+static bool s_fft_collection_mode = false;
+static uint16_t s_fft_sample_count = 512;
+static uint16_t s_fft_sample_rate_hz = 1600;
+static uint8_t s_gateway_mac[ESP_NOW_ETH_ALEN] = {0};
+static bool s_gateway_mac_set = false;
+
+// FFT packet tracking for retry mechanism
+typedef struct {
+    uint8_t packet_number;
+    bool acked;
+    uint32_t send_time;
+    uint8_t retry_count;
+} fft_packet_status_t;
+
+static fft_packet_status_t s_packet_status[MAX_FFT_PACKETS] = {0};
+
+// FFT Request Params (to pass from ISR/Callback to Task)
+typedef struct {
+    uint16_t sample_count;
+    uint16_t sample_rate_hz;
+    bool pending;
+} fft_request_t;
+
+static volatile fft_request_t s_fft_request = {0};
+
+// Semaphore for FFT ACK synchronization
+static SemaphoreHandle_t s_fft_ack_sem = NULL;
+
+// FFT function declarations
+static void start_fft_collection(uint16_t sample_count, uint16_t sample_rate_hz);
+static void perform_fft_and_send(float *samples, uint16_t sample_count);
+static void send_fft_packets_to_gateway(const float *fft_magnitude, uint16_t total_samples);
+static void handle_command_packet(const uint8_t *sender_mac, const command_packet_t *cmd);
 
 /**
  * @brief Setup GPIO8 as output and set it to LOW level
@@ -465,6 +506,44 @@ static void example_sensor_task_wrapper(void *arg)
 
     s_sensor_task_running = false;
 
+    // ⏰ Wait for potential FFT command from Gateway before sleeping
+    // Gateway needs time to:
+    // 1. Process sensor data
+    // 2. Send to server  
+    // 3. Receive response
+    // 4. Send FFT command back to Node
+        
+    // Poll for FFT command (check every 50ms)
+    // Total wait time: 30 seconds = 600 * 50ms
+    ESP_LOGI(TAG, "⏳ Waiting up to 30s for FFT command...");
+    
+    for (int i = 0; i < 600; i++)
+    {
+        if (s_fft_request.pending)
+        {
+            ESP_LOGI(TAG, "⚡ FFT Command Detected! Starting processing in Task context...");
+            
+            // Execute FFT logic here (in Task context, NOT callback)
+            start_fft_collection(s_fft_request.sample_count, s_fft_request.sample_rate_hz);
+            
+            // Clear pending flag after completion
+            s_fft_request.pending = false;
+            s_fft_collection_mode = false; // Done
+            
+            ESP_LOGI(TAG, "✅ FFT Request Processed.");
+            break;
+        }
+        
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+    
+    if (s_fft_collection_mode && !s_fft_request.pending) {
+       // Should be cleared, but safety check
+       s_fft_collection_mode = false; 
+    }
+    
+    ESP_LOGI(TAG, "💤 Proceeding to deep sleep");
+
     // Enter deep sleep immediately after finishing this cycle
     sleep_device();
 }
@@ -531,13 +610,17 @@ static void example_espnow_send_cb(const esp_now_send_info_t *tx_info, esp_now_s
         return;
     }
 
-    evt.id = EXAMPLE_ESPNOW_SEND_CB;
-    memcpy(send_cb->mac_addr, tx_info->des_addr, ESP_NOW_ETH_ALEN);
-    send_cb->status = status;
-    if (xQueueSend(s_example_espnow_queue, &evt, ESPNOW_MAXDELAY) != pdTRUE)
-    {
-        ESP_LOGW(TAG, "Send send queue fail");
-    }
+    // Since example_espnow_task is not running/consuming the queue, pushing to it will cause
+    // the queue to fill up. Once full, xQueueSend with ESPNOW_MAXDELAY will BLOCK the WiFi task
+    // for a long time (512 ticks), causing timeouts and packet loss.
+    // We should simply log the status or ignore it.
+    
+    ESP_LOGD(TAG, "Send data to " MACSTR ", status: %d", MAC2STR(send_cb->mac_addr), status);
+    
+    // if (xQueueSend(s_example_espnow_queue, &evt, ESPNOW_MAXDELAY) != pdTRUE)
+    // {
+    //    ESP_LOGW(TAG, "Send send queue fail");
+    // }
 }
 
 static void example_espnow_recv_cb(const esp_now_recv_info_t *recv_info, const uint8_t *data, int len)
@@ -552,6 +635,71 @@ static void example_espnow_recv_cb(const esp_now_recv_info_t *recv_info, const u
         ESP_LOGE(TAG, "Receive cb arg error");
         return;
     }
+
+    // DEBUG: Log ALL received packets
+    ESP_LOGI(TAG, "🔍 Received packet: len=%d, expected_ack_size=%d, expected_cmd_size=%d",
+             len, sizeof(fft_ack_packet_t), sizeof(command_packet_t));
+    
+    if (len <= 20) {
+        ESP_LOG_BUFFER_HEX(TAG, data, len); // Show raw data for small packets
+    }
+
+    // ============ Check if this is an ACK packet from Gateway ============
+    if (len == sizeof(fft_ack_packet_t))
+    {
+        fft_ack_packet_t ack;
+        memcpy(&ack, data, sizeof(ack));
+        
+        ESP_LOGI(TAG, "📬 ACK received for packet %u (status=%u, total_received=%u)",
+                 ack.packet_number, ack.status, ack.received_count);
+        
+        // Mark packet as acknowledged
+        if (ack.packet_number < MAX_FFT_PACKETS)
+        {
+            s_packet_status[ack.packet_number].acked = true;
+            
+            // Signal the waiting task that an ACK has been received
+            if (s_fft_ack_sem != NULL) {
+                xSemaphoreGive(s_fft_ack_sem);
+            }
+
+            if (ack.status == FFT_ACK_DUPLICATE)
+            {
+                ESP_LOGW(TAG, "⚠️  Gateway says packet %u is duplicate", ack.packet_number);
+            }
+        }
+        
+        return; // ACK handled, don't queue it
+    }
+    //=========================================================================
+
+    // ============ Check if this is a command packet from Gateway ============
+    if (len == sizeof(command_packet_t))
+    {
+        command_packet_t cmd;
+        memcpy(&cmd, data, sizeof(cmd));
+        
+        // Verify magic number
+        if (cmd.magic == CMD_MAGIC)
+        {
+            ESP_LOGI(TAG, "🎯 Received command packet from Gateway!");
+            
+            // Save Gateway MAC address for sending FFT data back
+            if (!s_gateway_mac_set)
+            {
+                memcpy(s_gateway_mac, mac_addr, ESP_NOW_ETH_ALEN);
+                s_gateway_mac_set = true;
+                ESP_LOGI(TAG, "Gateway MAC saved: %02X:%02X:%02X:%02X:%02X:%02X",
+                         s_gateway_mac[0], s_gateway_mac[1], s_gateway_mac[2],
+                         s_gateway_mac[3], s_gateway_mac[4], s_gateway_mac[5]);
+            }
+            
+            // Handle command immediately (not through queue)
+            handle_command_packet(mac_addr, &cmd);
+            return; // Don't queue command packets
+        }
+    }
+    // =========================================================================
 
     if (IS_BROADCAST_ADDR(des_addr))
     {
@@ -576,11 +724,15 @@ static void example_espnow_recv_cb(const esp_now_recv_info_t *recv_info, const u
     }
     memcpy(recv_cb->data, data, len);
     recv_cb->data_len = len;
-    if (xQueueSend(s_example_espnow_queue, &evt, ESPNOW_MAXDELAY) != pdTRUE)
-    {
-        ESP_LOGW(TAG, "Send receive queue fail");
-        free(recv_cb->data);
-    }
+    // Similar to send_cb, do not block on queue since no one is reading it.
+    ESP_LOGD(TAG, "Receive general data from: " MACSTR ", len: %d", MAC2STR(recv_cb->mac_addr), len);
+    free(recv_cb->data); // We allocated it above, must free since we aren't passing it to task
+    
+    // if (xQueueSend(s_example_espnow_queue, &evt, ESPNOW_MAXDELAY) != pdTRUE)
+    // {
+    //     ESP_LOGW(TAG, "Send receive queue fail");
+    //     free(recv_cb->data);
+    // }
 }
 
 /* Parse received ESPNOW data. */
@@ -854,6 +1006,15 @@ static esp_err_t example_espnow_init(void)
     memcpy(send_param->dest_mac, s_example_broadcast_mac, ESP_NOW_ETH_ALEN);
     example_espnow_data_prepare(send_param);
 
+    // Create semaphore for FFT ACK synchronization
+    if (s_fft_ack_sem == NULL) {
+        s_fft_ack_sem = xSemaphoreCreateBinary();
+        if (s_fft_ack_sem == NULL) {
+            ESP_LOGE(TAG, "Failed to create FFT ACK semaphore");
+            return ESP_FAIL;
+        }
+    }
+
     // xTaskCreate(example_espnow_task, "example_espnow_task", 2048, send_param, 4, NULL);
 
     return ESP_OK;
@@ -867,6 +1028,435 @@ static void example_espnow_deinit(example_espnow_send_param_t *send_param)
     s_example_espnow_queue = NULL;
     esp_now_deinit();
 }
+
+/* ============================================================================
+ * FFT Functions Implementation
+ * ============================================================================ */
+
+/**
+ * @brief Handle command packet received from Gateway
+ */
+static void handle_command_packet(const uint8_t *sender_mac, const command_packet_t *cmd)
+{
+    ESP_LOGI(TAG, "=== Processing Command Packet ===");
+    ESP_LOGI(TAG, "Command Type: 0x%02X", cmd->command_type);
+    ESP_LOGI(TAG, "Sample Count: %u", cmd->sample_count);
+    ESP_LOGI(TAG, "Sample Rate: %u Hz", cmd->sample_rate_hz);
+    
+    switch (cmd->command_type)
+    {
+        case CMD_START_FFT:
+            ESP_LOGI(TAG, "⚡ Received START_FFT command (Scheduling Task)");
+            
+            // Override: Force 1600Hz AND 2048 Samples
+            s_fft_request.sample_count = 2048; 
+            s_fft_request.sample_rate_hz = 1600;
+            s_fft_request.pending = true;
+            
+            // Prevent sleep immediately
+            s_fft_collection_mode = true;
+            
+            ESP_LOGI(TAG, "📝 FFT Request Scheduled: %u samples @ %u Hz", 
+                     s_fft_request.sample_count, s_fft_request.sample_rate_hz);
+            break;
+            
+        case CMD_STOP_FFT:
+            ESP_LOGI(TAG, "🛑 Stopping FFT collection");
+            s_fft_collection_mode = false;
+            break;
+            
+        case CMD_HEARTBEAT:
+            ESP_LOGI(TAG, "💓 Heartbeat command received");
+            // Future: could send a heartbeat response
+            break;
+            
+        default:
+            ESP_LOGW(TAG, "⚠️  Unknown command type: 0x%02X", cmd->command_type);
+            break;
+    }
+}
+
+/**
+ * @brief Start FFT data collection from sensor
+ */
+static void start_fft_collection(uint16_t sample_count, uint16_t sample_rate_hz)
+{
+    // Set flag to prevent sleep during FFT collection
+    s_fft_collection_mode = true;
+    
+    if (sample_count > FFT_MAX_SAMPLES)
+    {
+        ESP_LOGW(TAG, "Requested sample count %u exceeds max %u, capping", 
+                 sample_count, FFT_MAX_SAMPLES);
+        sample_count = FFT_MAX_SAMPLES;
+    }
+    
+    // Get sensor mutex
+    if (s_sensor_mutex != NULL)
+    {
+        if (xSemaphoreTake(s_sensor_mutex, pdMS_TO_TICKS(1000)) != pdTRUE)
+        {
+            ESP_LOGE(TAG, "Failed to take sensor mutex for FFT collection");
+            return;
+        }
+    }
+    
+    bmi160_handle_t handle = sensor_get_handle();
+    if (handle == NULL)
+    {
+        ESP_LOGE(TAG, "Cannot get sensor handle for FFT");
+        if (s_sensor_mutex != NULL)
+        {
+            xSemaphoreGive(s_sensor_mutex);
+        }
+        return;
+    }
+    
+    ESP_LOGI(TAG, "📊 Collecting %u samples at %u Hz...", sample_count, sample_rate_hz);
+    
+    // Configure sensor ODR to match requested sample rate
+    if (sample_rate_hz >= 1600)
+    {
+        bmi160_set_accel_rate(handle, BMI160_ACCEL_RATE_1600HZ);
+        // Ensure gyro is also compatible if needed, or just accel
+        vTaskDelay(pdMS_TO_TICKS(10)); // Allow sensor to settle
+    }
+    else if (sample_rate_hz >= 800)
+    {
+        bmi160_set_accel_rate(handle, BMI160_ACCEL_RATE_800HZ);
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    
+    // Allocate buffer for acceleration samples
+    float *accel_samples = (float *)heap_caps_malloc(sample_count * sizeof(float), MALLOC_CAP_DEFAULT);
+    if (accel_samples == NULL)
+    {
+        ESP_LOGE(TAG, "Failed to allocate memory for FFT samples");
+        // Restore default rate (assuming 100Hz) before returning
+        bmi160_set_accel_rate(handle, BMI160_ACCEL_RATE_100HZ);
+        if (s_sensor_mutex != NULL)
+        {
+            xSemaphoreGive(s_sensor_mutex);
+        }
+        return;
+    }
+    
+    // Calculate sampling period in microseconds
+    uint32_t sampling_period_us = 1000000 / sample_rate_hz;
+    ESP_LOGI(TAG, "Sampling period: %lu µs", (unsigned long)sampling_period_us);
+    
+    // Slight delay to align with next ODR cycle
+    esp_rom_delay_us(sampling_period_us);
+    
+    // Collect samples with precise timing
+    for (uint16_t i = 0; i < sample_count; i++)
+    {
+        int64_t start_time = esp_timer_get_time();
+        
+        // Read accelerometer data (using individual axis functions)
+        int16_t ax = 0, ay = 0, az = 0;
+        esp_err_t err_x = bmi160_get_acceleration_x(handle, &ax);
+        esp_err_t err_y = bmi160_get_acceleration_y(handle, &ay);
+        esp_err_t err_z = bmi160_get_acceleration_z(handle, &az);
+        
+        if (err_x != ESP_OK || err_y != ESP_OK || err_z != ESP_OK)
+        {
+            ESP_LOGW(TAG, "Failed to read accel at sample %u", i);
+            accel_samples[i] = 0.0f;
+        }
+        else
+        {
+            // Calculate magnitude: sqrt(ax² + ay² + az²)
+            float magnitude = sqrtf((float)(ax * ax) + (float)(ay * ay) + (float)(az * az));
+            accel_samples[i] = magnitude;
+        }
+        
+        // Wait for next sampling period
+        int64_t elapsed_us = esp_timer_get_time() - start_time;
+        int64_t wait_us = sampling_period_us - elapsed_us;
+        
+        if (wait_us > 0)
+        {
+            esp_rom_delay_us((uint32_t)wait_us);
+        }
+        else if (i % 100 == 0) // Log warning occasionally
+        {
+            ESP_LOGW(TAG, "Sample %u took %lld µs (target: %lu µs)", 
+                     i, (long long)elapsed_us, (unsigned long)sampling_period_us);
+        }
+    }
+    
+    // Restore default ODR (100Hz) to save power
+    if (sample_rate_hz >= 800)
+    {
+        bmi160_set_accel_rate(handle, BMI160_ACCEL_RATE_100HZ);
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+
+    ESP_LOGI(TAG, "✅ Collection complete, performing FFT...");
+    
+    // Release mutex
+    if (s_sensor_mutex != NULL)
+    {
+        xSemaphoreGive(s_sensor_mutex);
+    }
+    
+    // Perform FFT and send results
+    perform_fft_and_send(accel_samples, sample_count);
+    
+    // Free buffer
+    free(accel_samples);
+    
+    // Clear flag - FFT complete, can sleep now
+    s_fft_collection_mode = false;
+    ESP_LOGI(TAG, "✅ FFT collection complete, ready for sleep");
+}
+
+/**
+ * @brief Perform FFT on collected samples and send to Gateway
+ */
+static void perform_fft_and_send(float *samples, uint16_t sample_count)
+{
+    ESP_LOGI(TAG, "📊 Performing frequency analysis on %u samples...", sample_count);
+    
+    // --- 1. Remove DC Component (Gravity) ---
+    // This is crucial because accelerometer data includes gravity (~1g),
+    // which creates a huge spike at Bin 0 (0Hz).
+    float mean = 0;
+    for (int i = 0; i < sample_count; i++) {
+        mean += samples[i];
+    }
+    mean /= sample_count;
+    ESP_LOGI(TAG, "Removing DC offset (Gravity): %.4f", mean);
+    
+    for (int i = 0; i < sample_count; i++) {
+        samples[i] -= mean;
+    }
+
+    // --- 2. Apply Hann Window ---
+    // We must generate the window and multiply the signal.
+    // dsps_wind_hann_f32 GENERATES the window, it does NOT multiply in-place.
+    float *wind = (float *)heap_caps_malloc(sample_count * sizeof(float), MALLOC_CAP_DEFAULT);
+    if (wind == NULL) {
+        ESP_LOGE(TAG, "Failed to allocate window buffer, skipping windowing");
+    } else {
+        dsps_wind_hann_f32(wind, sample_count);
+        for (int i = 0; i < sample_count; i++) {
+            samples[i] *= wind[i];
+        }
+        free(wind);
+    }
+    
+    // Initialize ESP-DSP if needed (one time)
+    static bool dsp_initialized = false;
+    if (!dsp_initialized)
+    {
+        esp_err_t ret = dsps_fft2r_init_fc32(NULL, CONFIG_DSP_MAX_FFT_SIZE);
+        if (ret != ESP_OK) {
+            // Try explicit size if config definition is missing
+            ret = dsps_fft2r_init_fc32(NULL, 4096); 
+            if (ret != ESP_OK) {
+                ESP_LOGE(TAG, "Not possible to initialize FFT. Error = %i", ret);
+                return;
+            }
+        }
+        dsp_initialized = true;
+    }
+    
+    // Allocate buffer for FFT (complex data: real + imaginary)
+    // Size must be 2 * N * sizeof(float)
+    float *fft_buffer = (float *)heap_caps_malloc(sample_count * 2 * sizeof(float), MALLOC_CAP_DEFAULT);
+    if (fft_buffer == NULL)
+    {
+        ESP_LOGE(TAG, "Failed to allocate FFT buffer");
+        return;
+    }
+    
+    // Prepare input: Copy samples to Real part, set Imaginary to 0
+    for (int i = 0; i < sample_count; i++)
+    {
+        fft_buffer[i * 2 + 0] = samples[i];
+        fft_buffer[i * 2 + 1] = 0;
+    }
+    
+    uint32_t start_time = esp_timer_get_time() / 1000;
+    
+    // Compute FFT (Radix-2)
+    dsps_fft2r_fc32(fft_buffer, sample_count);
+    
+    // Bit Reverse (reorder output)
+    dsps_bit_rev_fc32(fft_buffer, sample_count);
+    
+    // Compute Magnitude Spectrum
+    float *magnitudes = (float *)heap_caps_malloc((sample_count / 2) * sizeof(float), MALLOC_CAP_DEFAULT);
+    if (magnitudes == NULL)
+    {
+        ESP_LOGE(TAG, "Failed to allocate magnitude buffer");
+        free(fft_buffer);
+        return;
+    }
+    
+    for (int i = 0; i < sample_count / 2; i++)
+    {
+        float real = fft_buffer[i * 2 + 0];
+        float imag = fft_buffer[i * 2 + 1];
+        // Normalize by N
+        magnitudes[i] = sqrtf(real * real + imag * imag) / sample_count;
+    }
+    
+    uint32_t total_time = (esp_timer_get_time() / 1000) - start_time;
+    ESP_LOGI(TAG, "✅ FFT Computed in %lu ms!", (unsigned long)total_time);
+    
+    // Free complex buffer early
+    free(fft_buffer);
+    
+    // Log first 10 bins for debugging
+    ESP_LOGI(TAG, "Frequency Analysis Results (first 10 bins):");
+    for (int i = 0; i < 10 && i < sample_count / 2; i++)
+    {
+        ESP_LOGI(TAG, "  Bin %d: %.4f", i, magnitudes[i]);
+    }
+    
+    // Send frequency data to Gateway (N/2 bins)
+    send_fft_packets_to_gateway(magnitudes, sample_count / 2);
+    
+    free(magnitudes);
+}
+
+/**
+ * @brief Send FFT magnitude data to Gateway (Stop-and-Wait ARQ)
+ * Sends one packet, waits for ACK, then sends next. Retries if no ACK.
+ */
+static void send_fft_packets_to_gateway(const float *fft_magnitude, uint16_t total_samples)
+{
+    if (!s_gateway_mac_set)
+    {
+        ESP_LOGW(TAG, "Gateway MAC not set, cannot send FFT data");
+        return;
+    }
+    
+    // Calculate number of packets needed
+    uint8_t total_packets = (total_samples + FFT_SAMPLES_PER_PACKET - 1) / FFT_SAMPLES_PER_PACKET;
+    if (total_packets > MAX_FFT_PACKETS)
+    {
+        ESP_LOGE(TAG, "Too many packets: %u (max %u)", total_packets, MAX_FFT_PACKETS);
+        return;
+    }
+    
+    uint32_t timestamp_ms = (uint32_t)(esp_timer_get_time() / 1000);
+    
+    ESP_LOGI(TAG, "📡 Sending %u FFT packets (Stop-and-Wait)...", total_packets);
+    
+    // Add Gateway as peer if not already added
+    if (!esp_now_is_peer_exist(s_gateway_mac))
+    {
+        esp_now_peer_info_t peer_info = {0};
+        memcpy(peer_info.peer_addr, s_gateway_mac, ESP_NOW_ETH_ALEN);
+        peer_info.channel = CONFIG_ESPNOW_CHANNEL;
+        peer_info.ifidx = ESPNOW_WIFI_IF;
+        peer_info.encrypt = false;
+        
+        esp_err_t ret = esp_now_add_peer(&peer_info);
+        if (ret != ESP_OK)
+        {
+            ESP_LOGE(TAG, "Failed to add Gateway peer: %s", esp_err_to_name(ret));
+            return;
+        }
+    }
+    
+    // Clear ACK status for all expected packets
+    for (int i = 0; i < total_packets; i++) {
+        s_packet_status[i].acked = false;
+        s_packet_status[i].packet_number = i;
+    }
+    
+    uint32_t start_time = esp_timer_get_time() / 1000;
+    
+    // --- STOP-AND-WAIT LOOP ---
+    for (uint8_t i = 0; i < total_packets; i++)
+    {
+        bool packet_acked = false;
+        
+        // Build packet
+        fft_data_packet_t packet = {0};
+        packet.packet_number = i;
+        packet.total_packets = total_packets;
+        packet.timestamp_ms = timestamp_ms;
+        
+        uint16_t samples_remaining = total_samples - (i * FFT_SAMPLES_PER_PACKET);
+        packet.samples_in_packet = (samples_remaining > FFT_SAMPLES_PER_PACKET) 
+                                    ? FFT_SAMPLES_PER_PACKET 
+                                    : samples_remaining;
+        
+        // Copy FFT data
+        for (uint16_t j = 0; j < packet.samples_in_packet; j++)
+        {
+            packet.fft_data[j] = fft_magnitude[i * FFT_SAMPLES_PER_PACKET + j];
+        }
+        
+        // Retry Loop
+        for (int retry = 0; retry < MAX_FFT_RETRIES; retry++)
+        {
+            // Send Packet
+            // Clear semaphore before sending to ensure we wait for a NEW ack
+            if (s_fft_ack_sem != NULL) {
+                xSemaphoreTake(s_fft_ack_sem, 0); 
+            }
+            
+            esp_err_t ret = esp_now_send(s_gateway_mac, (uint8_t *)&packet, sizeof(packet));
+            if (ret != ESP_OK)
+            {
+                ESP_LOGE(TAG, "✗ Send failed packet %u: %s", i, esp_err_to_name(ret));
+                vTaskDelay(pdMS_TO_TICKS(50)); // Wait before retry send
+                continue;
+            }
+            
+            // Wait for ACK (Semaphore)
+            // Timeout: FFT_ACK_TIMEOUT_MS
+            bool ack_received = false;
+            if (s_fft_ack_sem != NULL) {
+                // Wait for the semaphore signal (given in recv_cb)
+                if (xSemaphoreTake(s_fft_ack_sem, pdMS_TO_TICKS(FFT_ACK_TIMEOUT_MS)) == pdTRUE) {
+                    ack_received = true;
+                }
+            } else {
+                // Fallback if semaphore missing (shouldn't happen)
+                vTaskDelay(pdMS_TO_TICKS(FFT_ACK_TIMEOUT_MS)); 
+            }
+
+            // Check if THIS specific packet was ACKed (in case of spurious wakeups)
+            if (ack_received && s_packet_status[i].acked)
+            {
+                packet_acked = true;
+                ESP_LOGI(TAG, "✓ Packet %u/%u ACKed", i + 1, total_packets);
+                break; // Break retry loop
+            }
+            else
+            {
+                 // Separate log if semaphore taken but flag not set (rare, maybe duplicate ACK for other packet?)
+                 if (ack_received) {
+                     ESP_LOGW(TAG, "⚠️ ACK signal received but status not updated for packet %u", i);
+                 } else {
+                     ESP_LOGW(TAG, "⚠️ Packet %u timeout (No ACK), retry %d/%d", i, retry + 1, MAX_FFT_RETRIES);
+                 }
+            }
+        }
+        
+        // If after retries still not ACKed
+        if (!packet_acked)
+        {
+            ESP_LOGE(TAG, "❌ Failed to send packet %u after %d retries. Aborting.", i, MAX_FFT_RETRIES);
+            return; // Abort transmission or continue? Usually abort if integrity required.
+        }
+        
+        // Small delay between successful packets to be nice to network
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    
+    uint32_t elapsed = (esp_timer_get_time() / 1000) - start_time;
+    ESP_LOGI(TAG, "✅ Transmission Complete! Time: %lu ms", (unsigned long)elapsed);
+}
+
 static void configure_io4_wakeup(void) {
     // NOTE: GPIO4 is already configured in bmi160_create() with pull-up
     // BMI160 INT1 output is configured as active-HIGH, push-pull in bmi160_init_default()
