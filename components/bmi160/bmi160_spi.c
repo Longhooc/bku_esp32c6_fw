@@ -1052,7 +1052,10 @@ esp_err_t bmi160_read_fifo_headerless_accel(bmi160_handle_t handle, int16_t *acc
     }
     
     // Limit read size to prevent buffer overflow
-    uint16_t max_samples = 100; // Maximum samples to read at once
+    // BMI160 FIFO actual usable capacity: 996 bytes (not 1024)
+    // Likely due to watermark threshold or internal overhead (~28 bytes)
+    // For accel-only: 996 / 6 = 166 samples max
+    uint16_t max_samples = 166; // Maximum samples to read at once
     uint16_t max_bytes = max_samples * BMI160_ACCEL_FRAME_SIZE;
     if (fifo_count > max_bytes) {
         ESP_LOGW(TAG_BMI160, "FIFO count (%d) exceeds max read size (%d), limiting read", fifo_count, max_bytes);

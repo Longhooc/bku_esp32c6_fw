@@ -129,7 +129,7 @@ static SemaphoreHandle_t s_fft_ack_sem = NULL;
 
 // FFT function declarations
 static void start_fft_collection(uint16_t sample_count, uint16_t sample_rate_hz);
-static void perform_fft_and_send(float *samples, uint16_t sample_count);
+static void perform_fft_and_send(float *samples, uint16_t sample_count, uint16_t sample_rate_hz);
 static void send_fft_packets_to_gateway(const float *fft_magnitude, uint16_t total_samples);
 static void handle_command_packet(const uint8_t *sender_mac, const command_packet_t *cmd);
 
@@ -1077,7 +1077,10 @@ static void handle_command_packet(const uint8_t *sender_mac, const command_packe
 }
 
 /**
- * @brief Start FFT data collection from sensor
+ * @brief Start FFT data collection from sensor using FIFO (Batch Reading)
+ * 
+ * BMI160 FIFO is only 1024 bytes (~170 samples max).
+ * For 2048 samples, we read FIFO in multiple batches.
  */
 static void start_fft_collection(uint16_t sample_count, uint16_t sample_rate_hz)
 {
@@ -1097,6 +1100,7 @@ static void start_fft_collection(uint16_t sample_count, uint16_t sample_rate_hz)
         if (xSemaphoreTake(s_sensor_mutex, pdMS_TO_TICKS(1000)) != pdTRUE)
         {
             ESP_LOGE(TAG, "Failed to take sensor mutex for FFT collection");
+            s_fft_collection_mode = false;
             return;
         }
     }
@@ -1109,16 +1113,16 @@ static void start_fft_collection(uint16_t sample_count, uint16_t sample_rate_hz)
         {
             xSemaphoreGive(s_sensor_mutex);
         }
+        s_fft_collection_mode = false;
         return;
     }
     
-    ESP_LOGI(TAG, "📊 Collecting %u samples at %u Hz...", sample_count, sample_rate_hz);
+    ESP_LOGI(TAG, "📊 [FIFO BATCH MODE] Collecting %u samples at %u Hz...", sample_count, sample_rate_hz);
     
-    // Configure sensor ODR to match requested sample rate
+    // === STEP 1: Configure sensor ODR ===
     if (sample_rate_hz >= 1600)
     {
         bmi160_set_accel_rate(handle, BMI160_ACCEL_RATE_1600HZ);
-        // Ensure gyro is also compatible if needed, or just accel
         vTaskDelay(pdMS_TO_TICKS(10)); // Allow sensor to settle
     }
     else if (sample_rate_hz >= 800)
@@ -1126,96 +1130,208 @@ static void start_fft_collection(uint16_t sample_count, uint16_t sample_rate_hz)
         bmi160_set_accel_rate(handle, BMI160_ACCEL_RATE_800HZ);
         vTaskDelay(pdMS_TO_TICKS(10));
     }
+    else if (sample_rate_hz >= 400)
+    {
+        bmi160_set_accel_rate(handle, BMI160_ACCEL_RATE_400HZ);
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
     
-    // Allocate buffer for acceleration samples
+    // === STEP 2: Configure FIFO ===
+    esp_err_t err = bmi160_reset_fifo(handle);
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "Failed to reset FIFO: %s", esp_err_to_name(err));
+        goto cleanup;
+    }
+    
+    // Enable FIFO for accelerometer only (headerless mode)
+    bmi160_set_accel_fifo_enabled(handle, true);
+    bmi160_set_gyro_fifo_enabled(handle, false);
+    bmi160_set_fifo_header_mode_enabled(handle, false);
+    
+    // === STEP 3: Allocate final buffer ===
     float *accel_samples = (float *)heap_caps_malloc(sample_count * sizeof(float), MALLOC_CAP_DEFAULT);
     if (accel_samples == NULL)
     {
-        ESP_LOGE(TAG, "Failed to allocate memory for FFT samples");
-        // Restore default rate (assuming 100Hz) before returning
-        bmi160_set_accel_rate(handle, BMI160_ACCEL_RATE_100HZ);
-        if (s_sensor_mutex != NULL)
-        {
-            xSemaphoreGive(s_sensor_mutex);
-        }
-        return;
+        ESP_LOGE(TAG, "Failed to allocate FFT sample buffer");
+        goto cleanup;
     }
     
-    // Calculate sampling period in microseconds
-    uint32_t sampling_period_us = 1000000 / sample_rate_hz;
-    ESP_LOGI(TAG, "Sampling period: %lu µs", (unsigned long)sampling_period_us);
+    // === STEP 4: Continuous FIFO Reading ===
+    // Strategy: Poll FIFO continuously and read whenever data is available
+    // This prevents FIFO overflow at high sample rates (1600Hz)
+    // At 1600Hz, FIFO fills at ~166 samples/104ms - we must read faster than this
     
-    // Slight delay to align with next ODR cycle
-    esp_rom_delay_us(sampling_period_us);
+    uint16_t total_samples_collected = 0;
     
-    // Collect samples with precise timing
-    for (uint16_t i = 0; i < sample_count; i++)
+    ESP_LOGI(TAG, "Starting continuous FIFO reading: %u samples needed @ %u Hz", 
+             sample_count, sample_rate_hz);
+    ESP_LOGI(TAG, "FIFO will be polled continuously to prevent overflow");
+    
+    // Allocate temporary buffer for reading FIFO chunks
+    // Read up to 50 samples at a time for efficiency
+    const uint16_t READ_CHUNK_SIZE = 50;
+    int16_t *chunk_buffer = (int16_t *)heap_caps_malloc(READ_CHUNK_SIZE * 3 * sizeof(int16_t), MALLOC_CAP_DEFAULT);
+    if (chunk_buffer == NULL)
     {
-        int64_t start_time = esp_timer_get_time();
-        
-        // Read accelerometer data (using individual axis functions)
-        int16_t ax = 0, ay = 0, az = 0;
-        esp_err_t err_x = bmi160_get_acceleration_x(handle, &ax);
-        esp_err_t err_y = bmi160_get_acceleration_y(handle, &ay);
-        esp_err_t err_z = bmi160_get_acceleration_z(handle, &az);
-        
-        if (err_x != ESP_OK || err_y != ESP_OK || err_z != ESP_OK)
+        ESP_LOGE(TAG, "Failed to allocate chunk buffer");
+        free(accel_samples);
+        goto cleanup;
+    }
+    
+    uint32_t start_time = esp_timer_get_time() / 1000;
+    // Expected time: 2048 samples @ 1600Hz = 1.28s
+    // Add 3s margin for safety
+    uint32_t total_timeout_ms = (sample_count * 1000) / sample_rate_hz + 3000;
+    
+    ESP_LOGI(TAG, "Expected collection time: %lu ms, timeout: %lu ms",
+             (unsigned long)((sample_count * 1000) / sample_rate_hz),
+             (unsigned long)total_timeout_ms);
+    
+    uint32_t last_progress_log = 0;
+    
+    while (total_samples_collected < sample_count)
+    {
+        // Check timeout
+        uint32_t elapsed_ms = esp_timer_get_time() / 1000 - start_time;
+        if (elapsed_ms > total_timeout_ms)
         {
-            ESP_LOGW(TAG, "Failed to read accel at sample %u", i);
-            accel_samples[i] = 0.0f;
+            ESP_LOGE(TAG, "Timeout after %lu ms! Collected %u/%u samples", 
+                     (unsigned long)elapsed_ms, total_samples_collected, sample_count);
+            break;
         }
-        else
+        
+        // Check FIFO count
+        uint16_t fifo_count = 0;
+        err = bmi160_get_fifo_count(handle, &fifo_count);
+        if (err != ESP_OK)
         {
-            // Calculate magnitude: sqrt(ax² + ay² + az²)
+            ESP_LOGE(TAG, "Failed to get FIFO count: %s", esp_err_to_name(err));
+            break;
+        }
+        
+        // Check if we have at least 6 bytes (1 accelerometer frame)
+        if (fifo_count < 6)
+        {
+            // No data yet, poll again quickly
+            vTaskDelay(pdMS_TO_TICKS(1)); // 1ms delay
+            continue;
+        }
+        
+        // Calculate how many samples we can read
+        uint16_t available_samples = fifo_count / 6;
+        uint16_t samples_to_read = available_samples;
+        
+        // Limit to chunk size
+        if (samples_to_read > READ_CHUNK_SIZE)
+        {
+            samples_to_read = READ_CHUNK_SIZE;
+        }
+        
+        // Don't read more than we need
+        uint16_t samples_remaining = sample_count - total_samples_collected;
+        if (samples_to_read > samples_remaining)
+        {
+            samples_to_read = samples_remaining;
+        }
+        
+        // Read FIFO
+        uint16_t samples_read = 0;
+        err = bmi160_read_fifo_headerless_accel(handle, chunk_buffer, &samples_read);
+        if (err != ESP_OK)
+        {
+            ESP_LOGE(TAG, "Failed to read FIFO: %s", esp_err_to_name(err));
+            break;
+        }
+        
+        if (samples_read == 0)
+        {
+            // No samples read, continue polling
+            continue;
+        }
+        
+        // Convert to magnitude and store
+        for (uint16_t i = 0; i < samples_read && total_samples_collected < sample_count; i++)
+        {
+            int16_t ax = chunk_buffer[i * 3 + 0];
+            int16_t ay = chunk_buffer[i * 3 + 1];
+            int16_t az = chunk_buffer[i * 3 + 2];
+            
             float magnitude = sqrtf((float)(ax * ax) + (float)(ay * ay) + (float)(az * az));
-            accel_samples[i] = magnitude;
+            accel_samples[total_samples_collected] = magnitude;
+            total_samples_collected++;
         }
         
-        // Wait for next sampling period
-        int64_t elapsed_us = esp_timer_get_time() - start_time;
-        int64_t wait_us = sampling_period_us - elapsed_us;
-        
-        if (wait_us > 0)
+        // Log progress every 500 samples
+        if (total_samples_collected - last_progress_log >= 500)
         {
-            esp_rom_delay_us((uint32_t)wait_us);
-        }
-        else if (i % 100 == 0) // Log warning occasionally
-        {
-            ESP_LOGW(TAG, "Sample %u took %lld µs (target: %lu µs)", 
-                     i, (long long)elapsed_us, (unsigned long)sampling_period_us);
+            ESP_LOGI(TAG, "Progress: %u/%u samples (%.1f%%, FIFO: %u bytes)", 
+                     total_samples_collected, sample_count,
+                     (total_samples_collected * 100.0f) / sample_count,
+                     fifo_count);
+            last_progress_log = total_samples_collected;
         }
     }
     
-    // Restore default ODR (100Hz) to save power
-    if (sample_rate_hz >= 800)
+    free(chunk_buffer);
+    
+    uint32_t collection_time_ms = esp_timer_get_time() / 1000 - start_time;
+    
+    if (total_samples_collected < sample_count)
     {
-        bmi160_set_accel_rate(handle, BMI160_ACCEL_RATE_100HZ);
-        vTaskDelay(pdMS_TO_TICKS(10));
+        ESP_LOGW(TAG, "Collected fewer samples than requested: %u/%u in %lu ms", 
+                 total_samples_collected, sample_count, (unsigned long)collection_time_ms);
+        sample_count = total_samples_collected;
     }
-
-    ESP_LOGI(TAG, "✅ Collection complete, performing FFT...");
     
-    // Release mutex
+    if (sample_count == 0)
+    {
+        ESP_LOGE(TAG, "No samples collected!");
+        free(accel_samples);
+        goto cleanup;
+    }
+    
+    ESP_LOGI(TAG, "✅ Continuous FIFO reading complete! Collected %u samples in %lu ms", 
+             sample_count, (unsigned long)collection_time_ms);
+    ESP_LOGI(TAG, "   Actual sample rate: %.1f Hz (target: %u Hz)",
+             (sample_count * 1000.0f) / collection_time_ms, sample_rate_hz);
+    
+    // Release mutex before FFT processing
     if (s_sensor_mutex != NULL)
     {
         xSemaphoreGive(s_sensor_mutex);
     }
     
     // Perform FFT and send results
-    perform_fft_and_send(accel_samples, sample_count);
+    perform_fft_and_send(accel_samples, sample_count, sample_rate_hz);
     
-    // Free buffer
+    // Free sample buffer
     free(accel_samples);
     
     // Clear flag - FFT complete, can sleep now
     s_fft_collection_mode = false;
-    ESP_LOGI(TAG, "✅ FFT collection complete, ready for sleep");
+    ESP_LOGI(TAG, "✅ FFT processing complete, ready for sleep");
+    return;
+
+cleanup:
+    // Restore default settings
+    bmi160_set_accel_rate(handle, BMI160_ACCEL_RATE_100HZ);
+    bmi160_reset_fifo(handle);
+    bmi160_set_accel_fifo_enabled(handle, false);
+    
+    if (s_sensor_mutex != NULL)
+    {
+        xSemaphoreGive(s_sensor_mutex);
+    }
+    
+    s_fft_collection_mode = false;
+    ESP_LOGE(TAG, "❌ FFT collection failed");
 }
 
 /**
  * @brief Perform FFT on collected samples and send to Gateway
  */
-static void perform_fft_and_send(float *samples, uint16_t sample_count)
+static void perform_fft_and_send(float *samples, uint16_t sample_count, uint16_t sample_rate_hz)
 {
     ESP_LOGI(TAG, "📊 Performing frequency analysis on %u samples...", sample_count);
     
@@ -1296,12 +1412,35 @@ static void perform_fft_and_send(float *samples, uint16_t sample_count)
         return;
     }
     
+    float freq_res = (float)sample_rate_hz / sample_count;
+    // Conversion Factor: LSB -> mm/s^2
+    // BMI160 Range: +/- 16G (as configured in sensor.h): 2048 LSB = 1g = 9810 mm/s^2
+    // LSB_TO_MM_S2 = 9810 / 2048 = 4.79 mm/s^2 per LSB
+    const float LSB_TO_MM_S2 = 9810.0f / 2048.0f;
+    const float PI_2 = 6.2831853f;
+
     for (int i = 0; i < sample_count / 2; i++)
     {
         float real = fft_buffer[i * 2 + 0];
         float imag = fft_buffer[i * 2 + 1];
-        // Normalize by N
-        magnitudes[i] = sqrtf(real * real + imag * imag) / sample_count;
+        
+        // 1. Calculate Acceleration Magnitude (LSB)
+        // Normalized by N (standard DFT/FFT definition)
+        float mag_accel_lsb = sqrtf(real * real + imag * imag) / sample_count;
+        
+        // 2. Convert LSB -> mm/s^2
+        float mag_accel_mm_s2 = mag_accel_lsb * LSB_TO_MM_S2;
+
+        // 3. Convert Acceleration (mm/s^2) -> Velocity (mm/s)
+        // Formula: V = A / (2 * pi * f)
+        float frequency = i * freq_res;
+
+        if (i == 0 || frequency < 0.5f) {
+            // Suppress DC and very low frequency noise
+            magnitudes[i] = 0;
+        } else {
+            magnitudes[i] = mag_accel_mm_s2 / (PI_2 * frequency);
+        }
     }
     
     uint32_t total_time = (esp_timer_get_time() / 1000) - start_time;
@@ -1314,7 +1453,7 @@ static void perform_fft_and_send(float *samples, uint16_t sample_count)
     ESP_LOGI(TAG, "Frequency Analysis Results (first 10 bins):");
     for (int i = 0; i < 10 && i < sample_count / 2; i++)
     {
-        ESP_LOGI(TAG, "  Bin %d: %.4f", i, magnitudes[i]);
+        ESP_LOGI(TAG, "  Bin %d (%.1f Hz): %.4f mm/s", i, i * freq_res, magnitudes[i]);
     }
     
     // Send frequency data to Gateway (N/2 bins)
